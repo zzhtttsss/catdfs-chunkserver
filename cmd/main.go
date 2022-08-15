@@ -1,7 +1,7 @@
 package main
 
-import "fmt"
+import "tinydfs-chunkserver/internal/model"
 
 func main() {
-	fmt.Print("haha")
+	_ = model.MakeDataNode()
 }
