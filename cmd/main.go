@@ -1,7 +1,13 @@
 package main
 
-import "tinydfs-chunkserver/internal/model"
+import (
+	"tinydfs-chunkserver/internal/service"
+)
+
+func init() {
+	service.CreateChunkServerHandler()
+}
 
 func main() {
-	_ = model.MakeDataNode()
+
 }
