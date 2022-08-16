@@ -3,14 +3,13 @@ package model
 import (
 	"context"
 	"github.com/spf13/viper"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"log"
 	"net"
 	"sync"
 	"tinydfs-chunkserver/config"
 	"tinydfs-chunkserver/internal/service"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type DataNode struct {

@@ -1,6 +1,6 @@
 syntax="proto3";
 package pb;  // 生成的go文件所属包名
-option go_package="/internal/service;service";
+option go_package="/protocol";
 
 message DNRegisterArgs {
 
