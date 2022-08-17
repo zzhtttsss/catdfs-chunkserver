@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
 )
@@ -49,10 +50,33 @@ func DNRegister() (*grpc.ClientConn, string, string) {
 	return conn, res.Id, res.Addr
 }
 
+func (dn *DataNode) Heartbeat() {
+	reconnectCount := 0
+	for {
+		c := pb.NewHeartbeatServiceClient(dn.Conn)
+		res, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: dn.Id})
+		if err != nil {
+			log.Fatal(err)
+		}
+		if res.Code == common.MasterRPCServerFailed {
+			logrus.Panicf("[Id=%s] Heartbeat failed. Get ready to reconnect[Times=%d].\n", dn.Id, reconnectCount+1)
+			dn.reconnect()
+			reconnectCount++
+			if reconnectCount == 6 {
+				logrus.Panicf("[Id=%s] Reconnect failed. Offline.\n", dn.Id)
+				break
+			}
+			continue
+		}
+		time.Sleep(5 * time.Second)
+
+	}
+}
+
 //重连：NameNode挂了，重连并重新注册；DataNode或NameNode网络波动，不需要重新注册，重连并继续发送心跳即可
 func (dn *DataNode) reconnect() {
 	addr := viper.GetString(common.MasterAddr) + viper.GetString(common.MasterPort)
 	conn, _ := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	dn.Conn.Close()
+	_ = dn.Conn.Close()
 	dn.Conn = conn
 }

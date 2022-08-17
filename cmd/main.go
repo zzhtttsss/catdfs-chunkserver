@@ -9,5 +9,6 @@ func init() {
 }
 
 func main() {
-
+	go service.GlobalChunkServerHandler.GlobalDataNode.Heartbeat()
+	select {}
 }

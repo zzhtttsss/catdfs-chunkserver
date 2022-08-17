@@ -32,4 +32,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.0 // indirect
 )
 
-replace tinydfs-base => github.com/zzhtttsss/tinydfs-base latest
+replace tinydfs-base => github.com/zzhtttsss/tinydfs-base v0.0.0-20220817073012-0a336d4899a3
