@@ -2,3 +2,9 @@
 master:
   addr: "127.0.0.1"
   port: ":9099"
+
+# chunk server 配置
+chunk:
+  heartbeat:
+   reconnectCount: 5  # heartbeat出问题时的重连次数
+   sendTime: 5        # 每隔5s发送一次
