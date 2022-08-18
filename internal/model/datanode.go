@@ -62,13 +62,13 @@ func (dn *DataNode) Heartbeat() {
 			logrus.Panicf("[Id=%s] Heartbeat failed. Get ready to reconnect[Times=%d].\n", dn.Id, reconnectCount+1)
 			dn.reconnect()
 			reconnectCount++
-			if reconnectCount == 6 {
+			if reconnectCount == viper.GetInt(common.ChunkHeartbeatReconnectCount) {
 				logrus.Panicf("[Id=%s] Reconnect failed. Offline.\n", dn.Id)
 				break
 			}
 			continue
 		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)) * time.Second)
 
 	}
 }
