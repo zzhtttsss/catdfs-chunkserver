@@ -44,7 +44,7 @@ func RegisterDataNode() (*grpc.ClientConn, string, string) {
 	ctx := context.Background()
 	res, err := c.Register(ctx, &pb.DNRegisterArgs{})
 	if err != nil {
-		logrus.Panicf("fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
+		logrus.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
 		//Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
 	}
 	logrus.Infof("Register Success,get ID: %s", res.Id)
@@ -58,7 +58,7 @@ func (dn *DataNode) Heartbeat() {
 		_, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: dn.Id})
 
 		if err != nil {
-			logrus.Errorf("fail to heartbeat, error code: %v, error detail: %s,", common.ChunkServerHeartbeatFailed, err.Error())
+			logrus.Errorf("Fail to heartbeat, error code: %v, error detail: %s,", common.ChunkServerHeartbeatFailed, err.Error())
 			rpcError, _ := status.FromError(err)
 
 			if (rpcError.Details()[0]).(pb.RPCError).Code == common.MasterHeartbeatFailed {
