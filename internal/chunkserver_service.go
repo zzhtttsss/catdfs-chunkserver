@@ -2,7 +2,6 @@ package internal
 
 import (
 	"context"
-	"errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -11,13 +10,15 @@ import (
 	"google.golang.org/grpc/status"
 	"io"
 	"os"
+	"sync"
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
 )
 
 const (
-	addressKey = "address"
+	chunkIdString = "chunkId"
+	addressKey    = "address"
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -76,62 +77,94 @@ func reconnect() {
 func DoTransferFile(stream pb.PipLineService_TransferFileServer) error {
 	var (
 		pieceOfChunk *pb.PieceOfChunk
-		pieceChan    = make(chan *pb.PieceOfChunk)
-		nextAddress  string
-		err          error
 		nextStream   pb.PipLineService_TransferFileClient
+		wg           sync.WaitGroup
+		err          error
 	)
 
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(chunkIdString)[0]
 	addresses := md.Get(addressKey)
+
+	AddChunk(chunkId)
 	if len(addresses) != 0 {
-		nextAddress = addresses[0]
-		addresses = addresses[1:]
-		conn, _ := grpc.Dial(nextAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		c := pb.NewPipLineServiceClient(conn)
-		ctx := context.Background()
-		nextStream, err = c.TransferFile(ctx)
+		nextStream, err = getNextStream(chunkId, addresses)
+		if err != nil {
+			logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
+			return err
+		}
 	}
-	go storeFile(pieceChan, chunkId)
+	pieceChan := make(chan *pb.PieceOfChunk)
+	errChan := make(chan error)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		storeFile(pieceChan, errChan, chunkId)
+	}()
+
 	for {
 		pieceOfChunk, err = stream.Recv()
 		pieceChan <- pieceOfChunk
-		if nextAddress != "" {
+		if nextStream != nil {
 			err := nextStream.Send(pieceOfChunk)
 			if err != nil {
+				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
 				return err
 			}
 		}
 		if err == io.EOF {
 			close(pieceChan)
-			_, err = nextStream.CloseAndRecv()
-			if err != nil {
-				err = errors.New("failed to send status code")
-				return err
+			if nextStream != nil {
+				_, err = nextStream.CloseAndRecv()
+				if err != nil {
+					logrus.Errorf("fail to close send stream, error detail: %s", err.Error())
+					return err
+				}
 			}
 			err = stream.SendAndClose(&pb.TransferFileReply{})
 			if err != nil {
-				err = errors.New("failed to send status code")
+				logrus.Errorf("fail to close receive stream, error detail: %s", err.Error())
+				return err
+			}
+			wg.Wait()
+			if len(errChan) != 0 {
+				err = <-errChan
 				return err
 			}
 			return nil
 		}
-
 	}
 }
 
-func storeFile(pieceChan chan *pb.PieceOfChunk, chunkId string) {
+func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferFileClient, error) {
+	nextAddress := addresses[0]
+	addresses = addresses[1:]
+	conn, _ := grpc.Dial(nextAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c := pb.NewPipLineServiceClient(conn)
+	newCtx := context.Background()
+	for _, address := range addresses {
+		newCtx = metadata.AppendToOutgoingContext(newCtx, addressKey, address)
+	}
+	newCtx = metadata.AppendToOutgoingContext(newCtx, chunkIdString, chunkId)
+	return c.TransferFile(newCtx)
+}
+
+func storeFile(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
 	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId)
 	if err != nil {
 		logrus.Errorf("fail to open a chunk file, error detail: %s", err.Error())
+		errChan <- err
 	}
 	defer func() {
+		close(errChan)
 		chunkFile.Close()
 	}()
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
 			logrus.Errorf("fail to write a piece to chunk file, error detail: %s", err.Error())
+			errChan <- err
+			break
 		}
 	}
+
 }

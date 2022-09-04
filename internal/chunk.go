@@ -1,6 +1,11 @@
 package internal
 
-import "sync"
+import (
+	"strconv"
+	"strings"
+	"sync"
+	"tinydfs-base/common"
+)
 
 var (
 	// Store all Chunk, using id as the key
@@ -14,9 +19,15 @@ type Chunk struct {
 	Index  int
 }
 
-func AddChunk(chunk *Chunk) {
+func AddChunk(chunkId string) {
+	chunkInfo := strings.Split(chunkId, common.ChunkIdDelimiter)
+	index, _ := strconv.Atoi(chunkInfo[1])
 	updateChunksLock.Lock()
-	chunksMap[chunk.Id] = chunk
+	chunksMap[chunkId] = &Chunk{
+		Id:     chunkId,
+		FileId: chunkInfo[0],
+		Index:  index,
+	}
 	updateChunksLock.Unlock()
 }
 

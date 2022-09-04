@@ -4,15 +4,11 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"net"
 	"os"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
-)
-
-const (
-	chunkIdString = "chunkId"
 )
 
 var GlobalChunkServerHandler = &ChunkServerHandler{}
@@ -29,9 +25,9 @@ type ChunkServerHandler struct {
 
 // TransferFile 由Chunkserver调用该方法，维持心跳
 func (handler *ChunkServerHandler) TransferFile(stream pb.PipLineService_TransferFileServer) error {
-	md, _ := metadata.FromIncomingContext(stream.Context())
-	chunkId := md.Get(chunkIdString)[0]
-	logrus.Infof("start to receive snd send chunk : %s", chunkId)
+	p, _ := peer.FromContext(stream.Context())
+	address := p.Addr.String()
+	logrus.Infof("start to receive snd send chunk from: %s", address)
 	return DoTransferFile(stream)
 }
 
