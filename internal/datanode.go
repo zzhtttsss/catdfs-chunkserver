@@ -7,6 +7,7 @@ import (
 var DNInfo *DataNodeInfo
 
 type DataNodeInfo struct {
-	Id   string           // DataNode标识符
-	Conn *grpc.ClientConn // 与NN的rpc连接
+	Id string
+	// 与NN的rpc连接
+	Conn *grpc.ClientConn
 }

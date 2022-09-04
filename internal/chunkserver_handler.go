@@ -18,12 +18,7 @@ type ChunkServerHandler struct {
 	pb.UnimplementedPipLineServiceServer
 }
 
-////CreateChunkServerHandler 创建ChunkServerHandler
-//func CreateChunkServerHandler() {
-//	GlobalChunkServerHandler = &ChunkServerHandler{}
-//}
-
-// TransferFile 由Chunkserver调用该方法，维持心跳
+// TransferFile
 func (handler *ChunkServerHandler) TransferFile(stream pb.PipLineService_TransferFileServer) error {
 	p, _ := peer.FromContext(stream.Context())
 	address := p.Addr.String()
