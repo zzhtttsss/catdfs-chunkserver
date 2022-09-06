@@ -74,14 +74,15 @@ func reconnect() {
 	DNInfo.Conn = conn
 }
 
-func DoTransferFile(stream pb.PipLineService_TransferFileServer) error {
+func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	var (
 		pieceOfChunk *pb.PieceOfChunk
-		nextStream   pb.PipLineService_TransferFileClient
+		nextStream   pb.PipLineService_TransferChunkClient
 		wg           sync.WaitGroup
 		err          error
 	)
 
+	// Get chunkId and slice including all chunkserver address that need to store this chunk
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(chunkIdString)[0]
 	addresses := md.Get(addressKey)
@@ -94,14 +95,16 @@ func DoTransferFile(stream pb.PipLineService_TransferFileServer) error {
 			return err
 		}
 	}
+	// Every piece of chunk will be added into pieceChan so that storeChunk function can get all pieces sequentially
 	pieceChan := make(chan *pb.PieceOfChunk)
 	errChan := make(chan error)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		storeFile(pieceChan, errChan, chunkId)
+		storeChunk(pieceChan, errChan, chunkId)
 	}()
 
+	// Receive pieces of chunk until there are no more pieces
 	for {
 		pieceOfChunk, err = stream.Recv()
 		pieceChan <- pieceOfChunk
@@ -121,11 +124,12 @@ func DoTransferFile(stream pb.PipLineService_TransferFileServer) error {
 					return err
 				}
 			}
-			err = stream.SendAndClose(&pb.TransferFileReply{})
+			err = stream.SendAndClose(&pb.TransferChunkReply{})
 			if err != nil {
 				logrus.Errorf("fail to close receive stream, error detail: %s", err.Error())
 				return err
 			}
+			// Main thread will wait until goroutine success to store the block.
 			wg.Wait()
 			if len(errChan) != 0 {
 				err = <-errChan
@@ -136,7 +140,8 @@ func DoTransferFile(stream pb.PipLineService_TransferFileServer) error {
 	}
 }
 
-func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferFileClient, error) {
+// getNextStream Build stream to transfer this chunk to next chunkserver.
+func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	addresses = addresses[1:]
 	conn, _ := grpc.Dial(nextAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -146,10 +151,13 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 		newCtx = metadata.AppendToOutgoingContext(newCtx, addressKey, address)
 	}
 	newCtx = metadata.AppendToOutgoingContext(newCtx, chunkIdString, chunkId)
-	return c.TransferFile(newCtx)
+	return c.TransferChunk(newCtx)
 }
 
-func storeFile(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
+// StoreChunk store a chunk as a file named its id in this chunkserver.
+// For I/O operation is very slow, this function will be run in a goroutine to not block the main thread transferring
+// the chunk to another chunkserver.
+func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
 	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId)
 	if err != nil {
 		logrus.Errorf("fail to open a chunk file, error detail: %s", err.Error())
@@ -159,6 +167,7 @@ func storeFile(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId stri
 		close(errChan)
 		chunkFile.Close()
 	}()
+	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
 			logrus.Errorf("fail to write a piece to chunk file, error detail: %s", err.Error())
