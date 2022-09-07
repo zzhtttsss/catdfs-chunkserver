@@ -1,14 +1,16 @@
 package main
 
 import (
-	"tinydfs-chunkserver/internal/service"
+	"tinydfs-base/config"
+	"tinydfs-chunkserver/internal"
 )
 
 func init() {
-	service.CreateChunkServerHandler()
+	config.InitConfig()
+	internal.DNInfo = internal.RegisterDataNode()
 }
 
 func main() {
-	go service.GlobalChunkServerHandler.GlobalDataNode.Heartbeat()
+	internal.GlobalChunkServerHandler.Server()
 	select {}
 }

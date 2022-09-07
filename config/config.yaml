@@ -5,6 +5,9 @@ master:
 
 # chunk server 配置
 chunk:
+  port: "6789"
   heartbeat:
    reconnectCount: 5  # heartbeat出问题时的重连次数
    sendTime: 5        # 每隔5s发送一次
+  storage:
+    path: "./chunks/"
