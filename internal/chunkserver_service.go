@@ -16,11 +16,6 @@ import (
 	"tinydfs-base/protocol/pb"
 )
 
-const (
-	chunkIdString = "chunkId"
-	addressKey    = "address"
-)
-
 // RegisterDataNode 向NameNode注册DataNode，取得ID
 func RegisterDataNode() *DataNodeInfo {
 	addr := viper.GetString(common.MasterAddr) + viper.GetString(common.MasterPort)
@@ -84,8 +79,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 	// Get chunkId and slice including all chunkserver address that need to store this chunk
 	md, _ := metadata.FromIncomingContext(stream.Context())
-	chunkId := md.Get(chunkIdString)[0]
-	addresses := md.Get(addressKey)
+	chunkId := md.Get(common.ChunkIdString)[0]
+	addresses := md.Get(common.AddressString)
 
 	AddChunk(chunkId)
 	if len(addresses) != 0 {
@@ -148,9 +143,9 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
 	for _, address := range addresses {
-		newCtx = metadata.AppendToOutgoingContext(newCtx, addressKey, address)
+		newCtx = metadata.AppendToOutgoingContext(newCtx, common.AddressString, address)
 	}
-	newCtx = metadata.AppendToOutgoingContext(newCtx, chunkIdString, chunkId)
+	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIdString, chunkId)
 	return c.TransferChunk(newCtx)
 }
 
