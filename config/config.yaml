@@ -1,6 +1,6 @@
 # master 配置
 master:
-  addr: "127.0.0.1"
+  addr: "172.18.0.11"
   port: ":9099"
 
 # chunk server 配置
