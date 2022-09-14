@@ -98,18 +98,11 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		defer wg.Done()
 		storeChunk(pieceChan, errChan, chunkId)
 	}()
-
+	index := 0
 	// Receive pieces of chunk until there are no more pieces
 	for {
+		//logrus.Infof("index : %v", index)
 		pieceOfChunk, err = stream.Recv()
-		pieceChan <- pieceOfChunk
-		if nextStream != nil {
-			err := nextStream.Send(pieceOfChunk)
-			if err != nil {
-				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
-				return err
-			}
-		}
 		if err == io.EOF {
 			close(pieceChan)
 			if nextStream != nil {
@@ -130,8 +123,25 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 				err = <-errChan
 				return err
 			}
+			logrus.Info("OHHHHHHHHHHHH!")
 			return nil
 		}
+		if pieceOfChunk == nil {
+			logrus.Errorf("XXXXX pieceOfChunk is nil, chunkId = %s, index = %v", chunkId, index)
+			if err != nil {
+				logrus.Errorf("XXXXX pieceOfChunk is nil, error = %s", err.Error())
+			}
+		}
+		pieceChan <- pieceOfChunk
+		if nextStream != nil {
+			err := nextStream.Send(pieceOfChunk)
+			if err != nil {
+				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
+				return err
+			}
+		}
+
+		index++
 	}
 }
 
@@ -139,7 +149,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	addresses = addresses[1:]
-	conn, _ := grpc.Dial(nextAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
 	for _, address := range addresses {
@@ -163,12 +173,21 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 		chunkFile.Close()
 	}()
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan
+	index := 1
+
 	for piece := range pieceChan {
+		logrus.Infof("index is : %v", index)
+
+		if piece == nil {
+			logrus.Error("piece is nil")
+		}
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
 			logrus.Errorf("fail to write a piece to chunk file, error detail: %s", err.Error())
 			errChan <- err
 			break
 		}
+		logrus.Info("no err")
+		index++
 	}
 
 }
