@@ -16,11 +16,6 @@ import (
 	"tinydfs-base/protocol/pb"
 )
 
-const (
-	chunkIdString = "chunkId"
-	addressKey    = "address"
-)
-
 // RegisterDataNode 向NameNode注册DataNode，取得ID
 func RegisterDataNode() *DataNodeInfo {
 	addr := viper.GetString(common.MasterAddr) + viper.GetString(common.MasterPort)
@@ -84,8 +79,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 	// Get chunkId and slice including all chunkserver address that need to store this chunk
 	md, _ := metadata.FromIncomingContext(stream.Context())
-	chunkId := md.Get(chunkIdString)[0]
-	addresses := md.Get(addressKey)
+	chunkId := md.Get(common.ChunkIdString)[0]
+	addresses := md.Get(common.AddressString)
 
 	AddChunk(chunkId)
 	if len(addresses) != 0 {
@@ -103,18 +98,9 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		defer wg.Done()
 		storeChunk(pieceChan, errChan, chunkId)
 	}()
-
 	// Receive pieces of chunk until there are no more pieces
 	for {
 		pieceOfChunk, err = stream.Recv()
-		pieceChan <- pieceOfChunk
-		if nextStream != nil {
-			err := nextStream.Send(pieceOfChunk)
-			if err != nil {
-				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
-				return err
-			}
-		}
 		if err == io.EOF {
 			close(pieceChan)
 			if nextStream != nil {
@@ -135,7 +121,16 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 				err = <-errChan
 				return err
 			}
+			logrus.Info("OHHHHHHHHHHHH!")
 			return nil
+		}
+		pieceChan <- pieceOfChunk
+		if nextStream != nil {
+			err := nextStream.Send(pieceOfChunk)
+			if err != nil {
+				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
+				return err
+			}
 		}
 	}
 }
@@ -144,13 +139,13 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	addresses = addresses[1:]
-	conn, _ := grpc.Dial(nextAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
 	for _, address := range addresses {
-		newCtx = metadata.AppendToOutgoingContext(newCtx, addressKey, address)
+		newCtx = metadata.AppendToOutgoingContext(newCtx, common.AddressString, address)
 	}
-	newCtx = metadata.AppendToOutgoingContext(newCtx, chunkIdString, chunkId)
+	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIdString, chunkId)
 	return c.TransferChunk(newCtx)
 }
 
@@ -170,7 +165,7 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
-			logrus.Errorf("fail to write a piece to chunk file, error detail: %s", err.Error())
+			logrus.Errorf("fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
 			errChan <- err
 			break
 		}
