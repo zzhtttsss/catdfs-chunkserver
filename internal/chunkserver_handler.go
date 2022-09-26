@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -18,6 +19,7 @@ var GlobalChunkServerHandler = &ChunkServerHandler{}
 type ChunkServerHandler struct {
 	pb.UnimplementedRegisterServiceServer
 	pb.UnimplementedPipLineServiceServer
+	pb.UnimplementedMasterGetServiceServer
 }
 
 // TransferChunk Called by client or chunkserver.
@@ -37,6 +39,20 @@ func (handler *ChunkServerHandler) TransferChunk(stream pb.PipLineService_Transf
 		return details.Err()
 	}
 	return nil
+}
+
+func (handler *ChunkServerHandler) SetupStream2DataNode(ctx context.Context, args *pb.SetupStream2DataNodeArgs) (*pb.SetupStream2DataNodeReply, error) {
+	logrus.WithContext(ctx).Infof("Get request for set up stream with data node, DataNodeId: %s, ChunkId: %s", args.DataNodeId, args.ChunkId)
+	err := DoSendStream2Client(ctx, args)
+	if err != nil {
+		logrus.Errorf("Fail to check path and filename for add operation, error code: %v, error detail: %s,", common.MasterCheckArgs4AddFailed, err.Error())
+		details, _ := status.New(codes.Unavailable, err.Error()).WithDetails(&pb.RPCError{
+			Code: common.ChunkServerTransferChunkFailed,
+			Msg:  err.Error(),
+		})
+		return nil, details.Err()
+	}
+	return &pb.SetupStream2DataNodeReply{}, nil
 }
 
 func (handler *ChunkServerHandler) Server() {

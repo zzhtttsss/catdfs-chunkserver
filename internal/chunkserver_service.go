@@ -2,14 +2,18 @@ package internal
 
 import (
 	"context"
+	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"tinydfs-base/common"
@@ -170,5 +174,73 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 			break
 		}
 	}
+}
 
+// DoSendStream2Client call rpc to send data to client
+func DoSendStream2Client(ctx context.Context, args *pb.SetupStream2DataNodeArgs) error {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return fmt.Errorf("addr not found in context, DataNodeId: %s", args.DataNodeId)
+	}
+	//TODO 检查资源完整性
+	clientAddr := fmt.Sprintf("%s:%s", strings.Split(p.Addr.String(), ":")[0], args.ClientPort)
+	chunkIndex, _ := strconv.ParseInt(strings.Split(args.ChunkId, common.ChunkIdDelimiter)[1], 10, 32)
+	stream, err := setupStream2Client(clientAddr, int32(chunkIndex))
+	if err != nil {
+		return err
+	}
+	//wait to return until sendChunk is finished or err occurs
+	err = sendChunk(stream, args.ChunkId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// setupStream2Client builds up stream with client to transfer this chunk's data to client
+func setupStream2Client(clientAddr string, chunkIndex int32) (pb.PipLineService_TransferChunkClient, error) {
+	conn, _ := grpc.Dial(clientAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c := pb.NewPipLineServiceClient(conn)
+	newCtx := context.Background()
+	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIndexString, string(chunkIndex))
+	return c.TransferChunk(newCtx)
+}
+
+func sendChunk(stream pb.PipLineService_TransferChunkClient, chunkId string) error {
+	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
+	defer file.Close()
+	if err != nil {
+		return err
+	}
+	for i := 0; i < common.ChunkMBNum; i++ {
+		buffer := make([]byte, common.MB)
+		n, err := file.Read(buffer)
+		if err == io.EOF {
+			_, err = stream.CloseAndRecv()
+			if err != nil {
+				logrus.Errorf("fail to close stream, error detail: %s", err.Error())
+				return err
+			}
+			break
+		}
+		if stream == nil {
+			return fmt.Errorf("stream is nil")
+		}
+		err = stream.Send(&pb.PieceOfChunk{
+			Piece: buffer[:n],
+		})
+		if err != nil {
+			logrus.Errorf("fail to send a piece to client, error detail: %s", err.Error())
+			return err
+		}
+		//offset, _ = file.Seek(0, 1)
+		if i == common.ChunkMBNum-1 {
+			_, err = stream.CloseAndRecv()
+			if err != nil {
+				logrus.Errorf("fail to close stream, error detail: %s", err.Error())
+				return err
+			}
+		}
+	}
+	return nil
 }
