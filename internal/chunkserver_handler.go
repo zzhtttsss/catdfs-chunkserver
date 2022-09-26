@@ -46,7 +46,7 @@ func (handler *ChunkServerHandler) SetupStream2DataNode(ctx context.Context, arg
 	logrus.WithContext(ctx).Infof("Get request for set up stream with data node, DataNodeId: %s, ChunkId: %s", args.DataNodeId, args.ChunkId)
 	err := DoSendStream2Client(ctx, args)
 	if err != nil {
-		logrus.Errorf("Fail to check path and filename for add operation, error code: %v, error detail: %s,", common.MasterCheckArgs4AddFailed, err.Error())
+		logrus.Errorf("Fail to send stream to client for get operation, error code: %v, error detail: %s,", common.MasterCheckArgs4AddFailed, err.Error())
 		details, _ := status.New(codes.Unavailable, err.Error()).WithDetails(&pb.RPCError{
 			Code: common.ChunkServerTransferChunkFailed,
 			Msg:  err.Error(),

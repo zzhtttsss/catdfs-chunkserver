@@ -214,10 +214,17 @@ func sendChunk(stream pb.PipLineService_TransferChunkClient, chunkId string) err
 	if err != nil {
 		return err
 	}
+	info, _ := file.Stat()
+	log.Println("file size ", info.Size())
 	log.Println("sending chunk ", chunkId)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
+		_, err := file.Seek(int64(i*common.MB), 0)
+		if err != nil {
+			log.Println(err.Error())
+		}
 		n, err := file.Read(buffer)
+		log.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
 		if err == io.EOF {
 			_, err = stream.CloseAndRecv()
 			if err != nil {
