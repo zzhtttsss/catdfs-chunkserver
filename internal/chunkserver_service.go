@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -184,6 +185,7 @@ func DoSendStream2Client(ctx context.Context, args *pb.SetupStream2DataNodeArgs)
 	}
 	//TODO 检查资源完整性
 	clientAddr := fmt.Sprintf("%s:%s", strings.Split(p.Addr.String(), ":")[0], args.ClientPort)
+	log.Println("Get setup stream request from client ", clientAddr)
 	chunkIndex, _ := strconv.ParseInt(strings.Split(args.ChunkId, common.ChunkIdDelimiter)[1], 10, 32)
 	stream, err := setupStream2Client(clientAddr, int32(chunkIndex))
 	if err != nil {
@@ -212,6 +214,7 @@ func sendChunk(stream pb.PipLineService_TransferChunkClient, chunkId string) err
 	if err != nil {
 		return err
 	}
+	log.Println("sending chunk ", chunkId)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
 		n, err := file.Read(buffer)

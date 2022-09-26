@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"log"
 	"net"
 	"os"
 	"tinydfs-base/common"
@@ -19,7 +20,7 @@ var GlobalChunkServerHandler = &ChunkServerHandler{}
 type ChunkServerHandler struct {
 	pb.UnimplementedRegisterServiceServer
 	pb.UnimplementedPipLineServiceServer
-	pb.UnimplementedMasterGetServiceServer
+	pb.UnimplementedSetupStreamServer
 }
 
 // TransferChunk Called by client or chunkserver.
@@ -58,12 +59,14 @@ func (handler *ChunkServerHandler) SetupStream2DataNode(ctx context.Context, arg
 func (handler *ChunkServerHandler) Server() {
 	go Heartbeat()
 	listener, err := net.Listen(common.TCP, common.AddressDelimiter+viper.GetString(common.ChunkPort))
+	log.Println("Listen addr ", listener.Addr().String())
 	if err != nil {
 		logrus.Errorf("Fail to server, error code: %v, error detail: %s,", common.ChunkServerRPCServerFailed, err.Error())
 		os.Exit(1)
 	}
 	server := grpc.NewServer()
 	pb.RegisterPipLineServiceServer(server, handler)
+	pb.RegisterSetupStreamServer(server, handler)
 	logrus.Infof("Chunkserver is running, listen on %s%s", common.LocalIP, viper.GetString(common.ChunkPort))
 	server.Serve(listener)
 }
