@@ -209,8 +209,11 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
 		n, _ := file.Read(buffer)
+		// sending done
+		if n == 0 {
+			return nil
+		}
 		log.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
-		log.Println(string(buffer[:1024]))
 		err = stream.Send(&pb.Piece{
 			Piece: buffer[:n],
 		})
