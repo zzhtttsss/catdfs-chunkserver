@@ -201,6 +201,7 @@ func DoSendStream2Client(ctx context.Context, args *pb.SetupStream2DataNodeArgs)
 
 // setupStream2Client builds up stream with client to transfer this chunk's data to client
 func setupStream2Client(clientAddr string, chunkIndex int32) (pb.PipLineService_TransferChunkClient, error) {
+	log.Printf("set up stream 2 client %s", clientAddr)
 	conn, _ := grpc.Dial(clientAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
@@ -219,13 +220,11 @@ func sendChunk(stream pb.PipLineService_TransferChunkClient, chunkId string) err
 	log.Println("sending chunk ", chunkId)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
-		_, err := file.Seek(int64(i*common.MB), 0)
-		if err != nil {
-			log.Println(err.Error())
-		}
 		n, err := file.Read(buffer)
 		log.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
+		log.Println(string(buffer[:1024]))
 		if err == io.EOF {
+			log.Println("err==io.EOF")
 			_, err = stream.CloseAndRecv()
 			if err != nil {
 				logrus.Errorf("fail to close stream, error detail: %s", err.Error())
@@ -240,6 +239,7 @@ func sendChunk(stream pb.PipLineService_TransferChunkClient, chunkId string) err
 			Piece: buffer[:n],
 		})
 		if err != nil {
+			log.Println("Get sending error ", err.Error())
 			logrus.Errorf("fail to send a piece to client, error detail: %s", err.Error())
 			return err
 		}
