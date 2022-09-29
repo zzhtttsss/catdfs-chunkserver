@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -9,6 +10,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"io"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -170,5 +172,40 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 			break
 		}
 	}
+}
 
+// DoSendStream2Client call rpc to send data to client
+func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
+	//TODO 检查资源完整性
+	//wait to return until sendChunk is finished or err occurs
+	err := sendChunk(stream, args.ChunkId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
+	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
+	defer file.Close()
+	if err != nil {
+		return err
+	}
+	for i := 0; i < common.ChunkMBNum; i++ {
+		buffer := make([]byte, common.MB)
+		n, _ := file.Read(buffer)
+		// sending done
+		if n == 0 {
+			return nil
+		}
+		logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
+		err = stream.Send(&pb.Piece{
+			Piece: buffer[:n],
+		})
+		if err != nil {
+			log.Println("stream.Send error ", err)
+			return err
+		}
+	}
+	return nil
 }

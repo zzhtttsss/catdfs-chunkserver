@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"log"
 	"net"
 	"os"
 	"tinydfs-base/common"
@@ -18,6 +19,7 @@ var GlobalChunkServerHandler = &ChunkServerHandler{}
 type ChunkServerHandler struct {
 	pb.UnimplementedRegisterServiceServer
 	pb.UnimplementedPipLineServiceServer
+	pb.UnimplementedSetupStreamServer
 }
 
 // TransferChunk Called by client or chunkserver.
@@ -39,15 +41,31 @@ func (handler *ChunkServerHandler) TransferChunk(stream pb.PipLineService_Transf
 	return nil
 }
 
+func (handler *ChunkServerHandler) SetupStream2DataNode(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
+	logrus.Infof("Get request for set up stream with data node, DataNodeId: %s, ChunkId: %s", args.DataNodeId, args.ChunkId)
+	err := DoSendStream2Client(args, stream)
+	if err != nil {
+		logrus.Errorf("Fail to send stream to client for get operation, error code: %v, error detail: %s,", common.MasterCheckArgs4AddFailed, err.Error())
+		details, _ := status.New(codes.Unavailable, err.Error()).WithDetails(&pb.RPCError{
+			Code: common.ChunkServerTransferChunkFailed,
+			Msg:  err.Error(),
+		})
+		return details.Err()
+	}
+	return nil
+}
+
 func (handler *ChunkServerHandler) Server() {
 	go Heartbeat()
 	listener, err := net.Listen(common.TCP, common.AddressDelimiter+viper.GetString(common.ChunkPort))
+	log.Println("Listen addr ", listener.Addr().String())
 	if err != nil {
 		logrus.Errorf("Fail to server, error code: %v, error detail: %s,", common.ChunkServerRPCServerFailed, err.Error())
 		os.Exit(1)
 	}
 	server := grpc.NewServer()
 	pb.RegisterPipLineServiceServer(server, handler)
+	pb.RegisterSetupStreamServer(server, handler)
 	logrus.Infof("Chunkserver is running, listen on %s%s", common.LocalIP, viper.GetString(common.ChunkPort))
 	server.Serve(listener)
 }
