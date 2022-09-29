@@ -177,8 +177,6 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 // DoSendStream2Client call rpc to send data to client
 func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
 	//TODO 检查资源完整性
-	log.Println("Get setup stream request from client.Ready to send ", args.ChunkId)
-	//chunkIndex, _ := strconv.ParseInt(strings.Split(args.ChunkId, common.ChunkIdDelimiter)[1], 10, 32)
 	//wait to return until sendChunk is finished or err occurs
 	err := sendChunk(stream, args.ChunkId)
 	if err != nil {
@@ -187,25 +185,12 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 	return nil
 }
 
-// setupStream2Client builds up stream with client to transfer this chunk's data to client
-func setupStream2Client(clientAddr string, chunkIndex int32) (pb.PipLineService_TransferChunkClient, error) {
-	log.Printf("set up stream 2 client %s", clientAddr)
-	conn, _ := grpc.Dial(clientAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	c := pb.NewPipLineServiceClient(conn)
-	newCtx := context.Background()
-	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIndexString, string(chunkIndex))
-	return c.TransferChunk(newCtx)
-}
-
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
 	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
 	defer file.Close()
 	if err != nil {
 		return err
 	}
-	info, _ := file.Stat()
-	log.Println("file size ", info.Size())
-	log.Println("sending chunk ", chunkId)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
 		n, _ := file.Read(buffer)
@@ -213,7 +198,7 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 		if n == 0 {
 			return nil
 		}
-		log.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
+		logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
 		err = stream.Send(&pb.Piece{
 			Piece: buffer[:n],
 		})
