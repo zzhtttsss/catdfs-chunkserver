@@ -3,6 +3,7 @@ package internal
 import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -10,16 +11,30 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
 )
 
-var GlobalChunkServerHandler = &ChunkServerHandler{}
+var GlobalChunkServerHandler *ChunkServerHandler
 
 type ChunkServerHandler struct {
+	EtcdClient *clientv3.Client
 	pb.UnimplementedRegisterServiceServer
 	pb.UnimplementedPipLineServiceServer
 	pb.UnimplementedSetupStreamServer
+}
+
+func CreateGlobalChunkServerHandler() {
+	var err error
+	GlobalChunkServerHandler = &ChunkServerHandler{}
+	GlobalChunkServerHandler.EtcdClient, err = clientv3.New(clientv3.Config{
+		Endpoints:   []string{viper.GetString(common.EtcdEndPoint)},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		logrus.Panicf("Fail to get etcd client, error detail : %s", err.Error())
+	}
 }
 
 // TransferChunk Called by client or chunkserver.
