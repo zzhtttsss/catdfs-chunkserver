@@ -10,12 +10,18 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"io"
+	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
+)
+
+const (
+	ChunkDir = "../chunks/"
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -41,7 +47,11 @@ func Heartbeat() {
 	reconnectCount := 0
 	for {
 		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-		_, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: DNInfo.Id})
+		heartbeatArgs := &pb.HeartbeatArgs{
+			Id:      DNInfo.Id,
+			ChunkId: getLocalChunksId(),
+		}
+		_, err := c.Heartbeat(context.Background(), heartbeatArgs)
 
 		if err != nil {
 			logrus.Errorf("Fail to heartbeat, error code: %v, error detail: %s,", common.ChunkServerHeartbeatFailed, err.Error())
@@ -208,4 +218,16 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 		}
 	}
 	return nil
+}
+
+// getLocalChunksId walk through the chunk directory and get all chunks names
+func getLocalChunksId() []string {
+	var chunksId []string
+	filepath.Walk(ChunkDir, func(path string, info fs.FileInfo, err error) error {
+		if !info.IsDir() {
+			chunksId = append(chunksId, info.Name())
+		}
+		return nil
+	})
+	return chunksId
 }
