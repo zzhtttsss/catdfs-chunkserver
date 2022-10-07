@@ -3,8 +3,10 @@ package internal
 import (
 	"context"
 	"fmt"
+	"github.com/avast/retry-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -14,10 +16,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
+)
+
+const (
+	heartbeatRetryTime = 5
 )
 
 const (
@@ -26,14 +33,14 @@ const (
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
 func RegisterDataNode() *DataNodeInfo {
-	addr := viper.GetString(common.MasterAddr) + viper.GetString(common.MasterPort)
-	conn, _ := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, _ := getMasterConn()
 	c := pb.NewRegisterServiceClient(conn)
 	ctx := context.Background()
 	res, err := c.Register(ctx, &pb.DNRegisterArgs{})
 	if err != nil {
 		logrus.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
-		//Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
+		// Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
+		// Todo 错误可能是因为master的leader正好挂了，所以可以重新获取leader地址来重试
 	}
 	logrus.Infof("Register Success,get ID: %s", res.Id)
 
@@ -43,42 +50,44 @@ func RegisterDataNode() *DataNodeInfo {
 	}
 }
 
-func Heartbeat() {
-	reconnectCount := 0
-	for {
-		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-		heartbeatArgs := &pb.HeartbeatArgs{
-			Id:      DNInfo.Id,
-			ChunkId: getLocalChunksId(),
-		}
-		_, err := c.Heartbeat(context.Background(), heartbeatArgs)
-
-		if err != nil {
-			logrus.Errorf("Fail to heartbeat, error code: %v, error detail: %s,", common.ChunkServerHeartbeatFailed, err.Error())
-			rpcError, _ := status.FromError(err)
-
-			if (rpcError.Details()[0]).(pb.RPCError).Code == common.MasterHeartbeatFailed {
-				logrus.Errorf("[Id=%s] Heartbeat failed. Get ready to reconnect[Times=%d].\n", DNInfo.Id, reconnectCount+1)
-				reconnect()
-				reconnectCount++
-
-				if reconnectCount == viper.GetInt(common.ChunkHeartbeatReconnectCount) {
-					logrus.Fatalf("[Id=%s] Reconnect failed. Offline.\n", DNInfo.Id)
-					break
-				}
-				continue
-			}
-		}
-		time.Sleep(time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)) * time.Second)
+func getMasterConn() (*grpc.ClientConn, error) {
+	ctx := context.Background()
+	kv := clientv3.NewKV(GlobalChunkServerHandler.EtcdClient)
+	getResp, err := kv.Get(ctx, common.LeaderAddressKey)
+	if err != nil {
+		logrus.Errorf("Fail to get kv when init, error detail: %s", err.Error())
+		return nil, err
 	}
+	addr := string(getResp.Kvs[0].Value)
+	addr = strings.Split(addr, common.AddressDelimiter)[0] + viper.GetString(common.MasterPort)
+	logrus.Infof("leader master address is: %s", addr)
+	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		logrus.Errorf("Fail to get connection to leader , error detail: %s", err.Error())
+		return nil, err
+	}
+	return conn, nil
 }
 
-//重连：NameNode挂了，重连并重新注册；DataNode或NameNode网络波动，不需要重新注册，重连并继续发送心跳即可
-func reconnect() {
-	addr := viper.GetString(common.MasterAddr) + viper.GetString(common.MasterPort)
-	conn, _ := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	_ = DNInfo.Conn.Close()
-	DNInfo.Conn = conn
+func Heartbeat() {
+	for {
+		err := retry.Do(func() error {
+			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
+			_, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: DNInfo.Id})
+			if err != nil {
+				conn, _ := getMasterConn()
+				_ = DNInfo.Conn.Close()
+				DNInfo.Conn = conn
+				return err
+			}
+			return nil
+		}, retry.Attempts(heartbeatRetryTime), retry.Delay(time.Second*5))
+		if err != nil {
+			logrus.Fatalf("[Id=%s] Reconnect failed. Offline.\n", DNInfo.Id)
+		}
+		time.Sleep(time.Second * 5)
+	}
+
 }
 
 func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {

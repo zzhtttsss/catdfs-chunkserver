@@ -7,6 +7,7 @@ import (
 
 func init() {
 	config.InitConfig()
+	internal.CreateGlobalChunkServerHandler()
 	internal.DNInfo = internal.RegisterDataNode()
 }
 
