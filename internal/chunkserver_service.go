@@ -10,7 +10,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 	"io"
 	"io/fs"
 	"log"
@@ -25,10 +24,7 @@ import (
 
 const (
 	heartbeatRetryTime = 5
-)
-
-const (
-	ChunkDir = "../chunks/"
+	ChunkDir           = "../chunks/"
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -73,7 +69,11 @@ func Heartbeat() {
 	for {
 		err := retry.Do(func() error {
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-			_, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: DNInfo.Id})
+			heartbeatArgs := &pb.HeartbeatArgs{
+				Id:      DNInfo.Id,
+				ChunkId: getLocalChunksId(),
+			}
+			_, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
 				conn, _ := getMasterConn()
 				_ = DNInfo.Conn.Close()
