@@ -238,5 +238,6 @@ func getLocalChunksId() []string {
 		}
 		return nil
 	})
+	csChunkNumberMonitor.Set(float64(len(chunksId)))
 	return chunksId
 }
