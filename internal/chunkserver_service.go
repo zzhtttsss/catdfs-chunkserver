@@ -24,7 +24,7 @@ import (
 
 const (
 	heartbeatRetryTime = 5
-	ChunkDir           = "../chunks/"
+	ChunkDir           = "./chunks/"
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -233,7 +233,7 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 func getLocalChunksId() []string {
 	var chunksId []string
 	filepath.Walk(ChunkDir, func(path string, info fs.FileInfo, err error) error {
-		if !info.IsDir() {
+		if info != nil && !info.IsDir() {
 			chunksId = append(chunksId, info.Name())
 		}
 		return nil
