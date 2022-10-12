@@ -24,7 +24,6 @@ import (
 
 const (
 	heartbeatRetryTime = 5
-	ChunkDir           = "./chunks/"
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -232,7 +231,7 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 // getLocalChunksId walk through the chunk directory and get all chunks names
 func getLocalChunksId() []string {
 	var chunksId []string
-	filepath.Walk(ChunkDir, func(path string, info fs.FileInfo, err error) error {
+	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
 		if info != nil && !info.IsDir() {
 			chunksId = append(chunksId, info.Name())
 		}
