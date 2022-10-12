@@ -11,8 +11,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"io"
+	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +68,11 @@ func Heartbeat() {
 	for {
 		err := retry.Do(func() error {
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-			_, err := c.Heartbeat(context.Background(), &pb.HeartbeatArgs{Id: DNInfo.Id})
+			heartbeatArgs := &pb.HeartbeatArgs{
+				Id:      DNInfo.Id,
+				ChunkId: getLocalChunksId(),
+			}
+			_, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
 				conn, _ := getMasterConn()
 				_ = DNInfo.Conn.Close()
@@ -220,4 +226,17 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 		}
 	}
 	return nil
+}
+
+// getLocalChunksId walk through the chunk directory and get all chunks names
+func getLocalChunksId() []string {
+	var chunksId []string
+	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
+		if info != nil && !info.IsDir() {
+			chunksId = append(chunksId, info.Name())
+		}
+		return nil
+	})
+	csChunkNumberMonitor.Set(float64(len(chunksId)))
+	return chunksId
 }
