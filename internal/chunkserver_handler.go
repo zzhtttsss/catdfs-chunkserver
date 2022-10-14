@@ -18,6 +18,7 @@ import (
 
 var GlobalChunkServerHandler *ChunkServerHandler
 
+// ChunkServerHandler represent a chunkserver node to handle all incoming requests.
 type ChunkServerHandler struct {
 	EtcdClient *clientv3.Client
 	pb.UnimplementedRegisterServiceServer
@@ -38,8 +39,8 @@ func CreateGlobalChunkServerHandler() {
 }
 
 // TransferChunk Called by client or chunkserver.
-// Transfer a chunk of the file to a chunkserver using stream and let that chunkserver transfer
-// this chunk to another chunkserver if needed.
+// Transfer a chunk of the file to a chunkserver using stream and let that
+// chunkserver transfer this chunk to another chunkserver if needed.
 func (handler *ChunkServerHandler) TransferChunk(stream pb.PipLineService_TransferChunkServer) error {
 	p, _ := peer.FromContext(stream.Context())
 	address := p.Addr.String()
