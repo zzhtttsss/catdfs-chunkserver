@@ -7,6 +7,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -38,10 +39,12 @@ func RegisterDataNode() *DataNodeInfo {
 		// Todo 错误可能是因为master的leader正好挂了，所以可以重新获取leader地址来重试
 	}
 	logrus.Infof("Register Success,get ID: %s", res.Id)
-
+	var ioLoad atomic.Int64
+	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:   res.Id,
-		Conn: conn,
+		Id:     res.Id,
+		Conn:   conn,
+		IOLoad: ioLoad,
 	}
 }
 
@@ -71,6 +74,7 @@ func Heartbeat() {
 			heartbeatArgs := &pb.HeartbeatArgs{
 				Id:      DNInfo.Id,
 				ChunkId: getLocalChunksId(),
+				IOLoad:  GetIOLoad(),
 			}
 			_, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
@@ -84,7 +88,7 @@ func Heartbeat() {
 		if err != nil {
 			logrus.Fatalf("[Id=%s] Reconnect failed. Offline.\n", DNInfo.Id)
 		}
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Second * time.Duration(viper.GetInt(common.ChunkHeartbeatTime)))
 	}
 
 }
@@ -96,7 +100,6 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		wg           sync.WaitGroup
 		err          error
 	)
-
 	// Get chunkId and slice including all chunkserver address that need to store this chunk
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(common.ChunkIdString)[0]
@@ -118,6 +121,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		defer wg.Done()
 		storeChunk(pieceChan, errChan, chunkId)
 	}()
+	IncIOLoad()
+	defer DecIOLoad()
 	// Receive pieces of chunk until there are no more pieces
 	for {
 		pieceOfChunk, err = stream.Recv()
@@ -204,6 +209,8 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 }
 
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
+	IncIOLoad()
+	defer DecIOLoad()
 	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
 	defer file.Close()
 	if err != nil {
