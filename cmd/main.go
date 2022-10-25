@@ -19,6 +19,7 @@ func init() {
 	internal.CreateGlobalChunkServerHandler()
 	internal.DNInfo = internal.RegisterDataNode()
 	go internal.ConsumePendingChunks()
+	go internal.MonitorChunks()
 }
 
 func main() {

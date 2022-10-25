@@ -14,6 +14,7 @@ chunk:
   storage:
     path: "./chunks/"
     checkTime: 600
+    chunkDeadTime: 600
 
 # etcd config
 etcd:

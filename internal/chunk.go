@@ -51,9 +51,28 @@ func GetChunk(id string) *Chunk {
 	return chunksMap[id]
 }
 
+func GetAllChunkIds() []string {
+	updateChunksLock.RLock()
+	defer func() {
+		updateChunksLock.RUnlock()
+	}()
+
+	ids := make([]string, 0, len(chunksMap))
+	for id := range chunksMap {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func MonitorChunks() {
 	for {
-
+		updateChunksLock.Lock()
+		for id, chunk := range chunksMap {
+			if !chunk.IsComplete && int(time.Now().Sub(chunk.AddTime).Seconds()) > viper.GetInt(common.ChunkDeadTime) {
+				delete(chunksMap, id)
+			}
+		}
+		updateChunksLock.Unlock()
 		time.Sleep(time.Duration(viper.GetInt(common.ChunkCheckTime)) * time.Second)
 	}
 }

@@ -77,7 +77,7 @@ func Heartbeat() {
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
 			heartbeatArgs := &pb.HeartbeatArgs{
 				Id:                DNInfo.Id,
-				ChunkId:           getLocalChunksId(),
+				ChunkId:           GetAllChunkIds(),
 				IOLoad:            DNInfo.GetIOLoad(),
 				SuccessChunkInfos: successChunkInfos,
 				FailChunkInfos:    failChunkInfos,
