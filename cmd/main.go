@@ -18,6 +18,7 @@ func init() {
 	config.InitConfig()
 	internal.CreateGlobalChunkServerHandler()
 	internal.DNInfo = internal.RegisterDataNode()
+	go internal.ConsumePendingChunks()
 }
 
 func main() {

@@ -25,6 +25,7 @@ import (
 
 const (
 	heartbeatRetryTime = 5
+	maxGoroutineNum    = 5
 )
 
 // RegisterDataNode 向NameNode注册DataNode，取得ID
@@ -42,9 +43,10 @@ func RegisterDataNode() *DataNodeInfo {
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:     res.Id,
-		Conn:   conn,
-		IOLoad: ioLoad,
+		Id:               res.Id,
+		Conn:             conn,
+		ioLoad:           ioLoad,
+		pendingChunkChan: make(chan *PendingChunks),
 	}
 }
 
@@ -70,18 +72,38 @@ func getMasterConn() (*grpc.ClientConn, error) {
 func Heartbeat() {
 	for {
 		err := retry.Do(func() error {
+			failChunkInfos, successChunkInfos := HandleSendResult()
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
 			heartbeatArgs := &pb.HeartbeatArgs{
-				Id:      DNInfo.Id,
-				ChunkId: getLocalChunksId(),
-				IOLoad:  GetIOLoad(),
+				Id:                DNInfo.Id,
+				ChunkId:           getLocalChunksId(),
+				IOLoad:            DNInfo.GetIOLoad(),
+				SuccessChunkInfos: successChunkInfos,
+				FailChunkInfos:    failChunkInfos,
 			}
-			_, err := c.Heartbeat(context.Background(), heartbeatArgs)
+			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
 				conn, _ := getMasterConn()
 				_ = DNInfo.Conn.Close()
 				DNInfo.Conn = conn
 				return err
+			}
+			if len(heartbeatReply.ChunkInfos) != 0 {
+				infosMap := make(map[string][]string)
+				addsMap := make(map[string]string)
+				for i, info := range heartbeatReply.ChunkInfos {
+					dataNodeIds, ok := infosMap[info.ChunkId]
+					addsMap[info.DataNodeId] = heartbeatReply.DataNodeAddress[i]
+					if ok {
+						dataNodeIds = append(dataNodeIds, info.DataNodeId)
+					} else {
+						infosMap[info.ChunkId] = []string{info.DataNodeId}
+					}
+				}
+				DNInfo.Add2chan(&PendingChunks{
+					infos: infosMap,
+					adds:  addsMap,
+				})
 			}
 			return nil
 		}, retry.Attempts(heartbeatRetryTime), retry.Delay(time.Second*5))
@@ -95,25 +117,43 @@ func Heartbeat() {
 
 func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	var (
-		pieceOfChunk *pb.PieceOfChunk
-		nextStream   pb.PipLineService_TransferChunkClient
-		wg           sync.WaitGroup
-		err          error
+		pieceOfChunk   *pb.PieceOfChunk
+		nextStream     pb.PipLineService_TransferChunkClient
+		wg             sync.WaitGroup
+		err            error
+		isStoreSuccess bool
 	)
+	failAdds := make([]string, 0)
 	// Get chunkId and slice including all chunkserver address that need to store this chunk
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(common.ChunkIdString)[0]
 	addresses := md.Get(common.AddressString)
 
-	AddChunk(chunkId)
+	AddPendingChunk(chunkId)
+	defer func() {
+		currentReply := &pb.TransferChunkReply{
+			ChunkId:  chunkId,
+			FailAdds: failAdds,
+		}
+		err = stream.SendAndClose(currentReply)
+		// If current chunkserver can not send the result to previous chunkserver, we can not get how many
+		// chunkserver have failed, so we treat this situation as a failure.
+		if err != nil {
+			logrus.Errorf("Fail to close receive stream, error detail: %s", err.Error())
+			isStoreSuccess = false
+		}
+		FinishChunk(chunkId, isStoreSuccess)
+	}()
 	if len(addresses) != 0 {
+		// Todo: try each address until success
 		nextStream, err = getNextStream(chunkId, addresses)
 		if err != nil {
-			logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
-			return err
+			logrus.Errorf("Fail to get next stream, error detail: %s", err.Error())
+			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
+			nextStream = nil
 		}
 	}
-	// Every piece of chunk will be added into pieceChan so that storeChunk function can get all pieces sequentially
+	// Every piece of chunk will be added into pieceChan so that storeChunk function can get all pieces sequentially.
 	pieceChan := make(chan *pb.PieceOfChunk)
 	errChan := make(chan error)
 	wg.Add(1)
@@ -121,40 +161,47 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		defer wg.Done()
 		storeChunk(pieceChan, errChan, chunkId)
 	}()
-	IncIOLoad()
-	defer DecIOLoad()
-	// Receive pieces of chunk until there are no more pieces
+	DNInfo.IncIOLoad()
+	defer DNInfo.DecIOLoad()
+	// Receive pieces of chunk until there are no more pieces.
 	for {
 		pieceOfChunk, err = stream.Recv()
 		if err == io.EOF {
 			close(pieceChan)
 			if nextStream != nil {
-				_, err = nextStream.CloseAndRecv()
+				previousReply, err := nextStream.CloseAndRecv()
 				if err != nil {
-					logrus.Errorf("fail to close send stream, error detail: %s", err.Error())
-					return err
+					logrus.Errorf("Fail to close send stream, error detail: %s", err.Error())
+					failAdds = append(failAdds, addresses[1:]...)
+				} else {
+					failAdds = append(failAdds, previousReply.FailAdds...)
 				}
-			}
-			err = stream.SendAndClose(&pb.TransferChunkReply{})
-			if err != nil {
-				logrus.Errorf("fail to close receive stream, error detail: %s", err.Error())
-				return err
 			}
 			// Main thread will wait until goroutine success to store the block.
 			wg.Wait()
 			if len(errChan) != 0 {
 				err = <-errChan
+				logrus.Errorf("Fail to store a chunk, error detail: %s", err.Error())
+				isStoreSuccess = false
+				failAdds = append(failAdds, addresses[0])
 				return err
 			}
-			logrus.Info("OHHHHHHHHHHHH!")
+			isStoreSuccess = true
+			logrus.Infof("Success to store a chunk, id: %s", chunkId)
 			return nil
+		} else if err != nil {
+			logrus.Errorf("Fail to receive a piece from previous chunkserver, error detail: %s", err.Error())
+			close(pieceChan)
+			isStoreSuccess = false
+			return err
 		}
 		pieceChan <- pieceOfChunk
 		if nextStream != nil {
 			err := nextStream.Send(pieceOfChunk)
 			if err != nil {
-				logrus.Errorf("fail to send a piece to next chunkserver, error detail: %s", err.Error())
-				return err
+				logrus.Errorf("Fail to send a piece to next chunkserver, error detail: %s", err.Error())
+				failAdds = append(failAdds, addresses[1:]...)
+				nextStream = nil
 			}
 		}
 	}
@@ -178,15 +225,13 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 // For I/O operation is very slow, this function will be run in a goroutine to not block the main thread transferring
 // the chunk to another chunkserver.
 func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
+	defer close(errChan)
 	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId)
 	if err != nil {
 		logrus.Errorf("fail to open a chunk file, error detail: %s", err.Error())
 		errChan <- err
 	}
-	defer func() {
-		close(errChan)
-		chunkFile.Close()
-	}()
+	defer chunkFile.Close()
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
@@ -209,8 +254,8 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 }
 
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
-	IncIOLoad()
-	defer DecIOLoad()
+	DNInfo.IncIOLoad()
+	defer DNInfo.DecIOLoad()
 	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
 	defer file.Close()
 	if err != nil {
@@ -246,4 +291,113 @@ func getLocalChunksId() []string {
 	})
 	csChunkNumberMonitor.Set(float64(len(chunksId)))
 	return chunksId
+}
+
+func ConsumePendingChunks() {
+	for chunks := range DNInfo.pendingChunkChan {
+		var wg sync.WaitGroup
+		resultChan := make(chan *SingleSendResult)
+		for id, dataNodeIds := range chunks.infos {
+			chunkId := id
+			adds := make([]string, len(dataNodeIds))
+			for i := 0; i < len(dataNodeIds); i++ {
+				adds = append(adds, chunks.adds[dataNodeIds[i]])
+			}
+			stream, err := getNextStream(chunkId, adds)
+			if err != nil {
+				// Todo
+				logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sendChunk2Cs(stream, chunkId, dataNodeIds, adds, resultChan)
+			}()
+		}
+		wg.Wait()
+		close(resultChan)
+		var newFailSendResult = make(map[string][]string)
+		var newSuccessSendResult = make(map[string][]string)
+		for result := range resultChan {
+			newFailSendResult[result.chunkId] = result.failDataNodes
+			newSuccessSendResult[result.chunkId] = result.successDataNodes
+		}
+		Merge2SendResult(newFailSendResult, newSuccessSendResult)
+	}
+}
+
+func sendChunk2Cs(stream pb.PipLineService_TransferChunkClient, chunkId string, dataNodeIds []string,
+	adds []string, resultChan chan *SingleSendResult) {
+	DNInfo.IncIOLoad()
+	defer DNInfo.DecIOLoad()
+	defaultSingleResult := &SingleSendResult{
+		chunkId:          chunkId,
+		failDataNodes:    dataNodeIds,
+		successDataNodes: dataNodeIds[0:0],
+	}
+	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
+	defer file.Close()
+	if err != nil {
+		resultChan <- defaultSingleResult
+		return
+	}
+	for i := 0; i < common.ChunkMBNum; i++ {
+		buffer := make([]byte, common.MB)
+		n, _ := file.Read(buffer)
+		// sending done
+		if n == 0 {
+			transferChunkReply, err := stream.CloseAndRecv()
+			if err != nil {
+				resultChan <- defaultSingleResult
+				return
+			}
+			resultChan <- convReply2SingleResult(transferChunkReply, dataNodeIds, adds)
+			return
+		}
+		logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
+		err = stream.Send(&pb.PieceOfChunk{
+			Piece: buffer[:n],
+		})
+		if err != nil {
+			log.Println("stream.Send error ", err)
+			resultChan <- defaultSingleResult
+			return
+		}
+	}
+	transferChunkReply, err := stream.CloseAndRecv()
+	if err != nil {
+		resultChan <- defaultSingleResult
+		return
+	}
+	resultChan <- convReply2SingleResult(transferChunkReply, dataNodeIds, adds)
+}
+
+type SingleSendResult struct {
+	chunkId          string
+	failDataNodes    []string
+	successDataNodes []string
+}
+
+func convReply2SingleResult(transferChunkReply *pb.TransferChunkReply, dataNodeIds []string,
+	adds []string) *SingleSendResult {
+	singleSendResult := &SingleSendResult{
+		chunkId: transferChunkReply.ChunkId,
+	}
+	failDataNodes := make([]string, 0, len(adds))
+	successDataNodes := make([]string, 0, len(adds))
+	for _, a := range transferChunkReply.FailAdds {
+		isFail := false
+		for _, address := range adds {
+			if address == a {
+				isFail = true
+				break
+			}
+		}
+		if isFail {
+			failDataNodes = append(failDataNodes, a)
+			continue
+		}
+		successDataNodes = append(successDataNodes, a)
+	}
+	return singleSendResult
 }
