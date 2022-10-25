@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"github.com/spf13/viper"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,4 +49,11 @@ func GetChunk(id string) *Chunk {
 		updateChunksLock.RUnlock()
 	}()
 	return chunksMap[id]
+}
+
+func MonitorChunks() {
+	for {
+
+		time.Sleep(time.Duration(viper.GetInt(common.ChunkCheckTime)) * time.Second)
+	}
 }

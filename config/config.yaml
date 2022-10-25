@@ -13,6 +13,7 @@ chunk:
    sendTime: 5        # 每隔5s发送一次
   storage:
     path: "./chunks/"
+    checkTime: 600
 
 # etcd config
 etcd:

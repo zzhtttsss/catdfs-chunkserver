@@ -21,6 +21,7 @@ import (
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
+	"tinydfs-base/util"
 )
 
 const (
@@ -296,9 +297,22 @@ func getLocalChunksId() []string {
 func ConsumePendingChunks() {
 	for chunks := range DNInfo.pendingChunkChan {
 		var wg sync.WaitGroup
-		resultChan := make(chan *SingleSendResult)
-		for id, dataNodeIds := range chunks.infos {
+		infoChan := make(chan *ChunkSendInfo)
+		resultChan := make(chan *util.ChunkSendResult)
+		goroutineNum := maxGoroutineNum
+		if len(chunks.infos) < maxGoroutineNum {
+			goroutineNum = len(chunks.infos)
+		}
+		for i := 0; i < goroutineNum; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				go consumeSingleChunk(infoChan, resultChan)
+			}()
+		}
+		for id, dnId := range chunks.infos {
 			chunkId := id
+			dataNodeIds := dnId
 			adds := make([]string, len(dataNodeIds))
 			for i := 0; i < len(dataNodeIds); i++ {
 				adds = append(adds, chunks.adds[dataNodeIds[i]])
@@ -308,96 +322,75 @@ func ConsumePendingChunks() {
 				// Todo
 				logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
 			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				sendChunk2Cs(stream, chunkId, dataNodeIds, adds, resultChan)
-			}()
+			infoChan <- &ChunkSendInfo{
+				stream:      stream,
+				chunkId:     chunkId,
+				dataNodeIds: dataNodeIds,
+				adds:        adds,
+			}
 		}
 		wg.Wait()
 		close(resultChan)
 		var newFailSendResult = make(map[string][]string)
 		var newSuccessSendResult = make(map[string][]string)
 		for result := range resultChan {
-			newFailSendResult[result.chunkId] = result.failDataNodes
-			newSuccessSendResult[result.chunkId] = result.successDataNodes
+			newFailSendResult[result.ChunkId] = result.FailDataNodes
+			newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
 		}
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
 	}
 }
 
-func sendChunk2Cs(stream pb.PipLineService_TransferChunkClient, chunkId string, dataNodeIds []string,
-	adds []string, resultChan chan *SingleSendResult) {
-	DNInfo.IncIOLoad()
-	defer DNInfo.DecIOLoad()
-	defaultSingleResult := &SingleSendResult{
-		chunkId:          chunkId,
-		failDataNodes:    dataNodeIds,
-		successDataNodes: dataNodeIds[0:0],
-	}
-	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
-	defer file.Close()
-	if err != nil {
-		resultChan <- defaultSingleResult
-		return
-	}
-	for i := 0; i < common.ChunkMBNum; i++ {
-		buffer := make([]byte, common.MB)
-		n, _ := file.Read(buffer)
-		// sending done
-		if n == 0 {
-			transferChunkReply, err := stream.CloseAndRecv()
-			if err != nil {
-				resultChan <- defaultSingleResult
-				return
-			}
-			resultChan <- convReply2SingleResult(transferChunkReply, dataNodeIds, adds)
-			return
+type ChunkSendInfo struct {
+	stream      pb.PipLineService_TransferChunkClient
+	chunkId     string
+	dataNodeIds []string
+	adds        []string
+}
+
+func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
+	for info := range infoChan {
+		DNInfo.IncIOLoad()
+		defer DNInfo.DecIOLoad()
+		defaultSingleResult := &util.ChunkSendResult{
+			ChunkId:          info.chunkId,
+			FailDataNodes:    info.dataNodeIds,
+			SuccessDataNodes: info.dataNodeIds[0:0],
 		}
-		logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
-		err = stream.Send(&pb.PieceOfChunk{
-			Piece: buffer[:n],
-		})
+		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.chunkId))
+		defer file.Close()
 		if err != nil {
-			log.Println("stream.Send error ", err)
 			resultChan <- defaultSingleResult
 			return
 		}
-	}
-	transferChunkReply, err := stream.CloseAndRecv()
-	if err != nil {
-		resultChan <- defaultSingleResult
-		return
-	}
-	resultChan <- convReply2SingleResult(transferChunkReply, dataNodeIds, adds)
-}
-
-type SingleSendResult struct {
-	chunkId          string
-	failDataNodes    []string
-	successDataNodes []string
-}
-
-func convReply2SingleResult(transferChunkReply *pb.TransferChunkReply, dataNodeIds []string,
-	adds []string) *SingleSendResult {
-	singleSendResult := &SingleSendResult{
-		chunkId: transferChunkReply.ChunkId,
-	}
-	failDataNodes := make([]string, 0, len(adds))
-	successDataNodes := make([]string, 0, len(adds))
-	for _, a := range transferChunkReply.FailAdds {
-		isFail := false
-		for _, address := range adds {
-			if address == a {
-				isFail = true
-				break
+		for i := 0; i < common.ChunkMBNum; i++ {
+			buffer := make([]byte, common.MB)
+			n, _ := file.Read(buffer)
+			// sending done
+			if n == 0 {
+				transferChunkReply, err := info.stream.CloseAndRecv()
+				if err != nil {
+					resultChan <- defaultSingleResult
+					return
+				}
+				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
+				return
+			}
+			logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
+			err = info.stream.Send(&pb.PieceOfChunk{
+				Piece: buffer[:n],
+			})
+			if err != nil {
+				log.Println("stream.Send error ", err)
+				resultChan <- defaultSingleResult
+				return
 			}
 		}
-		if isFail {
-			failDataNodes = append(failDataNodes, a)
-			continue
+		transferChunkReply, err := info.stream.CloseAndRecv()
+		if err != nil {
+			resultChan <- defaultSingleResult
+			return
 		}
-		successDataNodes = append(successDataNodes, a)
+		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
 	}
-	return singleSendResult
 }
