@@ -2,6 +2,7 @@ package internal
 
 import (
 	"github.com/spf13/viper"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,10 +38,12 @@ func AddPendingChunk(chunkId string) {
 	updateChunksLock.Unlock()
 }
 
-func FinishChunk(chunkId string, isSuccess bool) {
-	updateChunksLock.RLock()
-	defer updateChunksLock.RUnlock()
-	chunksMap[chunkId].IsComplete = isSuccess
+func FinishChunk(chunkId string) {
+	_ = os.Rename(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
+		viper.GetString(common.ChunkStoragePath)+chunkId)
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
+	chunksMap[chunkId].IsComplete = true
 }
 
 func GetChunk(id string) *Chunk {

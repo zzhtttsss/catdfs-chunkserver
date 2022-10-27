@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"encoding/json"
+	"github.com/sirupsen/logrus"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"sync"
@@ -23,11 +25,11 @@ var failSendResult = make(map[string][]string)
 
 var successSendResult = make(map[string][]string)
 
-var updateMapLock *sync.RWMutex
+var updateMapLock = &sync.RWMutex{}
 
 type PendingChunks struct {
-	infos map[string][]string
-	adds  map[string]string
+	Infos map[string][]string `json:"infos"`
+	Adds  map[string]string   `json:"adds"`
 }
 
 func (d *DataNodeInfo) IncIOLoad() {
@@ -87,5 +89,17 @@ func HandleSendResult() ([]*pb.ChunkInfo, []*pb.ChunkInfo) {
 			})
 		}
 	}
+	bytes, err := json.Marshal(failSendResult)
+	if err != nil {
+		logrus.Errorf("Fail to marshal failSendResult, error detail: %s", err.Error())
+	}
+	logrus.Infof("failSendResult detail: %s", string(bytes))
+	bytes, err = json.Marshal(successSendResult)
+	if err != nil {
+		logrus.Errorf("Fail to marshal successSendResult, error detail: %s", err.Error())
+	}
+	logrus.Infof("successSendResult detail: %s", string(bytes))
+	failSendResult = make(map[string][]string)
+	successSendResult = make(map[string][]string)
 	return failChunkInfos, successChunkInfos
 }
