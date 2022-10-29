@@ -2,6 +2,7 @@ package internal
 
 import (
 	"github.com/spf13/viper"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,11 +17,14 @@ var (
 )
 
 type Chunk struct {
-	Id         string
-	FileId     string
-	Index      int
+	// Id is FileId + "_" + Index
+	Id     string
+	FileId string
+	Index  int
+	// IsComplete represents if the Chunk has been stored completely.
 	IsComplete bool
-	AddTime    time.Time
+	// AddTime is the time this Chunk add to chunksMap.
+	AddTime time.Time
 }
 
 func AddPendingChunk(chunkId string) {
@@ -37,10 +41,12 @@ func AddPendingChunk(chunkId string) {
 	updateChunksLock.Unlock()
 }
 
-func FinishChunk(chunkId string, isSuccess bool) {
+func FinishChunk(chunkId string) {
+	_ = os.Rename(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
+		viper.GetString(common.ChunkStoragePath)+chunkId)
 	updateChunksLock.Lock()
 	defer updateChunksLock.Unlock()
-	chunksMap[chunkId].IsComplete = isSuccess
+	chunksMap[chunkId].IsComplete = true
 }
 
 func GetChunk(id string) *Chunk {
@@ -64,11 +70,17 @@ func GetAllChunkIds() []string {
 	return ids
 }
 
+// MonitorChunks runs in a goroutine. It keeps looping to clear all incomplete
+// and timed out Chunk.
 func MonitorChunks() {
 	for {
 		updateChunksLock.Lock()
 		for id, chunk := range chunksMap {
 			if !chunk.IsComplete && int(time.Now().Sub(chunk.AddTime).Seconds()) > viper.GetInt(common.ChunkDeadTime) {
+				err := os.Remove(common.ChunkStoragePath + chunk.Id)
+				if err != nil {
+					continue
+				}
 				delete(chunksMap, id)
 			}
 		}

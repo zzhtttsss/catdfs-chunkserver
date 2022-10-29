@@ -14,6 +14,7 @@ import (
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
+	"tinydfs-base/util"
 )
 
 var GlobalChunkServerHandler *ChunkServerHandler
@@ -73,6 +74,8 @@ func (handler *ChunkServerHandler) SetupStream2DataNode(args *pb.SetupStream2Dat
 
 func (handler *ChunkServerHandler) Server() {
 	go Heartbeat()
+	ip, _ := util.GetLocalIP()
+	logrus.Infof("local ip is: %s", ip)
 	listener, err := net.Listen(common.TCP, common.AddressDelimiter+viper.GetString(common.ChunkPort))
 	log.Println("Listen addr ", listener.Addr().String())
 	if err != nil {
