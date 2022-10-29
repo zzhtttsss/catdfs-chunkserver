@@ -31,7 +31,7 @@ const (
 	inCompleteFileSuffix = "_incomplete"
 )
 
-// RegisterDataNode 向NameNode注册DataNode，取得ID
+// RegisterDataNode register this chunkserver to the master.
 func RegisterDataNode() *DataNodeInfo {
 	conn, _ := getMasterConn()
 	c := pb.NewRegisterServiceClient(conn)
@@ -72,6 +72,7 @@ func getMasterConn() (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// Heartbeat run in a goroutine. It
 func Heartbeat() {
 	for {
 		err := retry.Do(func() error {
@@ -150,12 +151,13 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			FinishChunk(chunkId)
 		}
 	}()
-	if len(addresses) != 0 {
+	if len(addresses) > 1 {
 		// Todo: try each address until success
-		nextStream, err = getNextStream(chunkId, addresses)
+		nextStream, err = getNextStream(chunkId, addresses[1:])
 		if err != nil {
 			logrus.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
+			failAdds = append(failAdds, addresses[1:]...)
 			nextStream = nil
 		}
 	}
@@ -216,8 +218,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 // getNextStream Build stream to transfer this chunk to next chunkserver.
 func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
-	logrus.Infof("get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
-	addresses = addresses[1:]
+	logrus.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
 	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
@@ -318,7 +319,7 @@ func ConsumePendingChunks() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				go consumeSingleChunk(infoChan, resultChan)
+				consumeSingleChunk(infoChan, resultChan)
 			}()
 		}
 		for id, dnId := range chunks.Infos {
@@ -331,13 +332,14 @@ func ConsumePendingChunks() {
 			stream, err := getNextStream(chunkId, adds)
 			if err != nil {
 				// Todo
+				stream = nil
 				logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
 			}
 			infoChan <- &ChunkSendInfo{
 				stream:      stream,
-				chunkId:     chunkId,
-				dataNodeIds: dataNodeIds,
-				adds:        adds,
+				ChunkId:     chunkId,
+				DataNodeIds: dataNodeIds,
+				Adds:        adds,
 			}
 		}
 		wg.Wait()
@@ -355,9 +357,9 @@ func ConsumePendingChunks() {
 
 type ChunkSendInfo struct {
 	stream      pb.PipLineService_TransferChunkClient
-	chunkId     string
-	dataNodeIds []string
-	adds        []string
+	ChunkId     string   `json:"chunk_id"`
+	DataNodeIds []string `json:"data_node_ids"`
+	Adds        []string `json:"adds"`
 }
 
 func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
@@ -367,13 +369,17 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			logrus.Errorf("Fail to marshal chunks, error detail: %s", err.Error())
 		}
 		logrus.Infof("Start to consume a single chunk, info detail: %s", string(bytes))
-		DNInfo.IncIOLoad()
 		defaultSingleResult := &util.ChunkSendResult{
-			ChunkId:          info.chunkId,
-			FailDataNodes:    info.dataNodeIds,
-			SuccessDataNodes: info.dataNodeIds[0:0],
+			ChunkId:          info.ChunkId,
+			FailDataNodes:    info.DataNodeIds,
+			SuccessDataNodes: info.DataNodeIds[0:0],
 		}
-		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.chunkId))
+		if info.stream == nil {
+			resultChan <- defaultSingleResult
+			return
+		}
+		DNInfo.IncIOLoad()
+		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.ChunkId))
 		if err != nil {
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
@@ -392,12 +398,11 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 					file.Close()
 					return
 				}
-				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
+				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds)
 				DNInfo.DecIOLoad()
 				file.Close()
 				return
 			}
-			logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
 			err = info.stream.Send(&pb.PieceOfChunk{
 				Piece: buffer[:n],
 			})
@@ -416,7 +421,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			file.Close()
 			return
 		}
-		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
+		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds)
 		DNInfo.DecIOLoad()
 		file.Close()
 		logrus.Infof("Success to consume a single chunk.")
