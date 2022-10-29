@@ -1,8 +1,6 @@
 package internal
 
 import (
-	"encoding/json"
-	"github.com/sirupsen/logrus"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"sync"
@@ -13,23 +11,32 @@ var DNInfo *DataNodeInfo
 
 type DataNodeInfo struct {
 	Id string
-	// 与NN的rpc连接
+	// Conn is RPC connection with the leader of the master cluster.
 	Conn *grpc.ClientConn
-
+	// ioLoad represent IO load of a chunkserver.
 	ioLoad atomic.Int64
-
-	pendingChunkChan chan *PendingChunks
+	// taskChan is used to cache all incoming SendingTask.
+	taskChan chan *SendingTask
 }
 
-var failSendResult = make(map[string][]string)
+var (
+	// failSendResult contains all fail results of SendingTask that have been completed
+	// but not notified to the master.
+	// key: Chunk' id; value: slice of DataNode' id
+	failSendResult = make(map[string][]string)
+	// successSendResult contains all success results of SendingTask that have been
+	// completed but not notified to the master.
+	// key: Chunk' id; value: slice of DataNode' id
+	successSendResult = make(map[string][]string)
+	updateMapLock     = &sync.RWMutex{}
+)
 
-var successSendResult = make(map[string][]string)
-
-var updateMapLock = &sync.RWMutex{}
-
-type PendingChunks struct {
+// SendingTask represent all Chunk sending jobs given by the master in one heartbeat.
+type SendingTask struct {
+	// Infos key: Chunk' id; value: slice of DataNode' id
 	Infos map[string][]string `json:"infos"`
-	Adds  map[string]string   `json:"adds"`
+	// Adds key: DataNode' id; value: DataNode' address
+	Adds map[string]string `json:"adds"`
 }
 
 func (d *DataNodeInfo) IncIOLoad() {
@@ -44,8 +51,8 @@ func (d *DataNodeInfo) GetIOLoad() int64 {
 	return d.ioLoad.Load()
 }
 
-func (d *DataNodeInfo) Add2chan(chunks *PendingChunks) {
-	d.pendingChunkChan <- chunks
+func (d *DataNodeInfo) Add2chan(chunks *SendingTask) {
+	d.taskChan <- chunks
 }
 
 func Merge2SendResult(newFailSendResult map[string][]string, newSuccessSendResult map[string][]string) {
@@ -68,6 +75,8 @@ func Merge2SendResult(newFailSendResult map[string][]string, newSuccessSendResul
 	}
 }
 
+// HandleSendResult converts all results in failSendResult and successSendResult
+// to protocol type and clear failSendResult and successSendResult.
 func HandleSendResult() ([]*pb.ChunkInfo, []*pb.ChunkInfo) {
 	updateMapLock.Lock()
 	defer updateMapLock.Unlock()
@@ -89,16 +98,6 @@ func HandleSendResult() ([]*pb.ChunkInfo, []*pb.ChunkInfo) {
 			})
 		}
 	}
-	bytes, err := json.Marshal(failSendResult)
-	if err != nil {
-		logrus.Errorf("Fail to marshal failSendResult, error detail: %s", err.Error())
-	}
-	logrus.Infof("failSendResult detail: %s", string(bytes))
-	bytes, err = json.Marshal(successSendResult)
-	if err != nil {
-		logrus.Errorf("Fail to marshal successSendResult, error detail: %s", err.Error())
-	}
-	logrus.Infof("successSendResult detail: %s", string(bytes))
 	failSendResult = make(map[string][]string)
 	successSendResult = make(map[string][]string)
 	return failChunkInfos, successChunkInfos

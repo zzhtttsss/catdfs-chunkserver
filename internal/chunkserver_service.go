@@ -2,7 +2,6 @@ package internal
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/avast/retry-go"
 	"github.com/sirupsen/logrus"
@@ -14,7 +13,6 @@ import (
 	"google.golang.org/grpc/metadata"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,13 +44,14 @@ func RegisterDataNode() *DataNodeInfo {
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:               res.Id,
-		Conn:             conn,
-		ioLoad:           ioLoad,
-		pendingChunkChan: make(chan *PendingChunks),
+		Id:       res.Id,
+		Conn:     conn,
+		ioLoad:   ioLoad,
+		taskChan: make(chan *SendingTask),
 	}
 }
 
+// getMasterConn get the RPC connection with the leader of the master cluster.
 func getMasterConn() (*grpc.ClientConn, error) {
 	ctx := context.Background()
 	kv := clientv3.NewKV(GlobalChunkServerHandler.EtcdClient)
@@ -72,7 +71,10 @@ func getMasterConn() (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// Heartbeat run in a goroutine. It
+// Heartbeat run in a goroutine. It keeps looping to do heartbeat with master
+// every several seconds. It sends the result of transferring Chunk and receive
+// the information which Chunk need to be transferred next and put the information
+// into the taskChan.
 func Heartbeat() {
 	for {
 		err := retry.Do(func() error {
@@ -104,7 +106,7 @@ func Heartbeat() {
 						infosMap[info.ChunkId] = []string{info.DataNodeId}
 					}
 				}
-				DNInfo.Add2chan(&PendingChunks{
+				DNInfo.Add2chan(&SendingTask{
 					Infos: infosMap,
 					Adds:  addsMap,
 				})
@@ -128,7 +130,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		isStoreSuccess bool
 	)
 	failAdds := make([]string, 0)
-	// Get chunkId and slice including all chunkserver address that need to store this chunk
+	// Get chunkId and slice including all chunkserver address that need to store this chunk.
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(common.ChunkIdString)[0]
 	addresses := md.Get(common.AddressString)
@@ -141,8 +143,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			FailAdds: failAdds,
 		}
 		err = stream.SendAndClose(currentReply)
-		// If current chunkserver can not send the result to previous chunkserver, we can not get how many
-		// chunkserver have failed, so we treat this situation as a failure.
+		// If current chunkserver can not send the result to previous chunkserver, we can not get
+		// how many chunkserver have failed, so we treat this situation as a failure.
 		if err != nil {
 			logrus.Errorf("Fail to close receive stream, error detail: %s", err.Error())
 			isStoreSuccess = false
@@ -161,7 +163,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			nextStream = nil
 		}
 	}
-	// Every piece of chunk will be added into pieceChan so that storeChunk function can get all pieces sequentially.
+	// Every piece of chunk will be added into pieceChan so that storeChunk function
+	// can get all pieces sequentially.
 	pieceChan := make(chan *pb.PieceOfChunk)
 	errChan := make(chan error)
 	wg.Add(1)
@@ -215,7 +218,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	}
 }
 
-// getNextStream Build stream to transfer this chunk to next chunkserver.
+// getNextStream builds stream to transfer this chunk to next chunkserver in the
+// pipeline.
 func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	logrus.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
@@ -229,9 +233,9 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 	return c.TransferChunk(newCtx)
 }
 
-// StoreChunk store a chunk as a file named its id in this chunkserver.
-// For I/O operation is very slow, this function will be run in a goroutine to not block the main thread transferring
-// the chunk to another chunkserver.
+// StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
+// operation is very slow, this function will be run in a goroutine to not block
+// the main thread transferring the chunk to another chunkserver.
 func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
 	defer close(errChan)
 	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId + inCompleteFileSuffix)
@@ -240,7 +244,7 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 		errChan <- err
 	}
 	defer chunkFile.Close()
-	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan
+	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
 			logrus.Errorf("fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
@@ -250,7 +254,7 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	}
 }
 
-// DoSendStream2Client call rpc to send data to client
+// DoSendStream2Client calls rpc to send data to client.
 func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
 	//TODO 检查资源完整性
 	//wait to return until sendChunk is finished or err occurs
@@ -261,6 +265,8 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 	return nil
 }
 
+// sendChunk establishes a pipeline and sends a Chunk to next chunkserver in the
+// pipeline. It is used to implement Chunk transmission between chunkservers.
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
@@ -272,23 +278,20 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 	for i := 0; i < common.ChunkMBNum; i++ {
 		buffer := make([]byte, common.MB)
 		n, _ := file.Read(buffer)
-		// sending done
 		if n == 0 {
 			return nil
 		}
-		logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
 		err = stream.Send(&pb.Piece{
 			Piece: buffer[:n],
 		})
 		if err != nil {
-			log.Println("stream.Send error ", err)
 			return err
 		}
 	}
 	return nil
 }
 
-// getLocalChunksId walk through the chunk directory and get all chunks names
+// getLocalChunksId walks through the chunk directory and get all chunks names.
 func getLocalChunksId() []string {
 	var chunksId []string
 	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
@@ -301,13 +304,11 @@ func getLocalChunksId() []string {
 	return chunksId
 }
 
-func ConsumePendingChunks() {
-	for chunks := range DNInfo.pendingChunkChan {
-		bytes, err := json.Marshal(chunks)
-		if err != nil {
-			logrus.Errorf("Fail to marshal chunks, error detail: %s", err.Error())
-		}
-		logrus.Infof("Start to a batch of chunk, chunks detail: %s", string(bytes))
+// ConsumeSendingTasks runs in a goroutine. It gets and consumes SendingTask from
+// taskChan. In particular, it will send all Chunk to the target chunkservers in
+// the SendingTask and merge the result of SendingTask into existing results.
+func ConsumeSendingTasks() {
+	for chunks := range DNInfo.taskChan {
 		var wg sync.WaitGroup
 		infoChan := make(chan *ChunkSendInfo)
 		resultChan := make(chan *util.ChunkSendResult, len(chunks.Infos))
@@ -351,7 +352,6 @@ func ConsumePendingChunks() {
 			newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
 		}
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
-		logrus.Infof("Success to a batch of chunk.")
 	}
 }
 
@@ -362,13 +362,10 @@ type ChunkSendInfo struct {
 	Adds        []string `json:"adds"`
 }
 
+// consumeSingleChunk establishes a pipeline, sends a Chunk to all target chunkserver
+// through the pipeline and return the result by the resultChan.
 func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
 	for info := range infoChan {
-		bytes, err := json.Marshal(info)
-		if err != nil {
-			logrus.Errorf("Fail to marshal chunks, error detail: %s", err.Error())
-		}
-		logrus.Infof("Start to consume a single chunk, info detail: %s", string(bytes))
 		defaultSingleResult := &util.ChunkSendResult{
 			ChunkId:          info.ChunkId,
 			FailDataNodes:    info.DataNodeIds,
@@ -379,7 +376,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			return
 		}
 		DNInfo.IncIOLoad()
-		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.ChunkId))
+		file, err := os.Open(common.ChunkStoragePath + info.ChunkId)
 		if err != nil {
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
@@ -407,7 +404,6 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 				Piece: buffer[:n],
 			})
 			if err != nil {
-				log.Println("stream.Send error ", err)
 				resultChan <- defaultSingleResult
 				DNInfo.DecIOLoad()
 				file.Close()
@@ -424,6 +420,5 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds)
 		DNInfo.DecIOLoad()
 		file.Close()
-		logrus.Infof("Success to consume a single chunk.")
 	}
 }
