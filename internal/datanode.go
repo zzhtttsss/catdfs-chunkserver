@@ -25,8 +25,13 @@ var successSendResult = make(map[string][]string)
 
 var updateMapLock *sync.RWMutex
 
+type PendingChunk struct {
+	chunkId  string
+	sendType int
+}
+
 type PendingChunks struct {
-	infos map[string][]string
+	infos map[PendingChunk][]string
 	adds  map[string]string
 }
 

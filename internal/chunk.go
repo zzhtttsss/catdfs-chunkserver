@@ -38,8 +38,8 @@ func AddPendingChunk(chunkId string) {
 }
 
 func FinishChunk(chunkId string, isSuccess bool) {
-	updateChunksLock.RLock()
-	defer updateChunksLock.RUnlock()
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
 	chunksMap[chunkId].IsComplete = isSuccess
 }
 

@@ -29,12 +29,14 @@ const (
 	maxGoroutineNum    = 5
 )
 
-// RegisterDataNode 向NameNode注册DataNode，取得ID
+// RegisterDataNode registers in the Master and get the datanode id
 func RegisterDataNode() *DataNodeInfo {
 	conn, _ := getMasterConn()
 	c := pb.NewRegisterServiceClient(conn)
 	ctx := context.Background()
-	res, err := c.Register(ctx, &pb.DNRegisterArgs{})
+	res, err := c.Register(ctx, &pb.DNRegisterArgs{
+		ChunkIds: getLocalChunksId(),
+	})
 	if err != nil {
 		logrus.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
 		// Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
@@ -90,15 +92,21 @@ func Heartbeat() {
 				return err
 			}
 			if len(heartbeatReply.ChunkInfos) != 0 {
-				infosMap := make(map[string][]string)
+				// 存储一个chunk要去哪些DataNode
+				infosMap := make(map[PendingChunk][]string)
+				// 存储一个DataNode对应的Address地址
 				addsMap := make(map[string]string)
 				for i, info := range heartbeatReply.ChunkInfos {
-					dataNodeIds, ok := infosMap[info.ChunkId]
+					pc := PendingChunk{
+						chunkId:  info.ChunkId,
+						sendType: int(info.SendType),
+					}
+					dataNodeIds, ok := infosMap[pc]
 					addsMap[info.DataNodeId] = heartbeatReply.DataNodeAddress[i]
 					if ok {
 						dataNodeIds = append(dataNodeIds, info.DataNodeId)
 					} else {
-						infosMap[info.ChunkId] = []string{info.DataNodeId}
+						infosMap[pc] = []string{info.DataNodeId}
 					}
 				}
 				DNInfo.Add2chan(&PendingChunks{
@@ -310,8 +318,8 @@ func ConsumePendingChunks() {
 				go consumeSingleChunk(infoChan, resultChan)
 			}()
 		}
-		for id, dnId := range chunks.infos {
-			chunkId := id
+		for pc, dnId := range chunks.infos {
+			chunkId := pc.chunkId
 			dataNodeIds := dnId
 			adds := make([]string, len(dataNodeIds))
 			for i := 0; i < len(dataNodeIds); i++ {
@@ -327,6 +335,7 @@ func ConsumePendingChunks() {
 				chunkId:     chunkId,
 				dataNodeIds: dataNodeIds,
 				adds:        adds,
+				sendType:    pc.sendType,
 			}
 		}
 		wg.Wait()
@@ -334,8 +343,14 @@ func ConsumePendingChunks() {
 		var newFailSendResult = make(map[string][]string)
 		var newSuccessSendResult = make(map[string][]string)
 		for result := range resultChan {
-			newFailSendResult[result.ChunkId] = result.FailDataNodes
-			newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
+			if result.SendType == common.Copy {
+				newFailSendResult[result.ChunkId] = result.FailDataNodes
+				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
+			} else if result.SendType == common.Move {
+				newFailSendResult[result.ChunkId] = []string{}
+				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
+				go removeChunkById(result.ChunkId)
+			}
 		}
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
 	}
@@ -346,20 +361,22 @@ type ChunkSendInfo struct {
 	chunkId     string
 	dataNodeIds []string
 	adds        []string
+	sendType    int
 }
 
 func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
 	for info := range infoChan {
 		DNInfo.IncIOLoad()
-		defer DNInfo.DecIOLoad()
+
 		defaultSingleResult := &util.ChunkSendResult{
 			ChunkId:          info.chunkId,
 			FailDataNodes:    info.dataNodeIds,
 			SuccessDataNodes: info.dataNodeIds[0:0],
+			SendType:         info.sendType,
 		}
 		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.chunkId))
-		defer file.Close()
 		if err != nil {
+			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
 			return
 		}
@@ -373,7 +390,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 					resultChan <- defaultSingleResult
 					return
 				}
-				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
+				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds, info.sendType)
 				return
 			}
 			logrus.Printf("Reading chunkMB index %d, reading bytes num %d", i, n)
@@ -391,6 +408,12 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			resultChan <- defaultSingleResult
 			return
 		}
-		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds)
+		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds, info.sendType)
+		DNInfo.DecIOLoad()
+		file.Close()
 	}
+}
+
+func removeChunkById(chunkId string) {
+	_ = os.Remove(fmt.Sprintf("./chunks/%s", chunkId))
 }
