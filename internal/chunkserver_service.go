@@ -77,6 +77,7 @@ func Heartbeat() {
 		err := retry.Do(func() error {
 			failChunkInfos, successChunkInfos := HandleSendResult()
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
+			//TODO 10/29 判断Chunk是否满足条件，允许该cs运行
 			heartbeatArgs := &pb.HeartbeatArgs{
 				Id:                DNInfo.Id,
 				ChunkId:           GetAllChunkIds(),
