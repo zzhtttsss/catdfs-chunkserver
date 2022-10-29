@@ -31,6 +31,18 @@ var (
 	updateMapLock     = &sync.RWMutex{}
 )
 
+var successSendResult = make(map[string][]string)
+
+var updateMapLock *sync.RWMutex
+
+type PendingChunk struct {
+	chunkId  string
+	sendType int
+}
+
+type PendingChunks struct {
+	infos map[PendingChunk][]string
+	adds  map[string]string
 // SendingTask represent all Chunk sending jobs given by the master in one heartbeat.
 type SendingTask struct {
 	// Infos key: Chunk' id; value: slice of DataNode' id
