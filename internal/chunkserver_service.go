@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/metadata"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -336,8 +335,8 @@ func ConsumeSendingTasks() {
 				consumeSingleChunk(infoChan, resultChan)
 			}()
 		}
-		for id, dnId := range chunks.Infos {
-			chunkId := id
+		for pc, dnId := range chunks.Infos {
+			chunkId := pc.chunkId
 			dataNodeIds := dnId
 			adds := make([]string, 0, len(dataNodeIds))
 			for i := 0; i < len(dataNodeIds); i++ {
