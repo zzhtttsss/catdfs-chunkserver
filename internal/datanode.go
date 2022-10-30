@@ -17,6 +17,10 @@ type DataNodeInfo struct {
 	ioLoad atomic.Int64
 	// taskChan is used to cache all incoming SendingTask.
 	taskChan chan *SendingTask
+	//pendingChunkNum means the number of pending chunks in expansion operation
+	pendingChunkNum int
+	// IsReady represents this datanode is ready to serve with master.
+	IsReady bool
 }
 
 var (
@@ -31,22 +35,15 @@ var (
 	updateMapLock     = &sync.RWMutex{}
 )
 
-var successSendResult = make(map[string][]string)
-
-var updateMapLock *sync.RWMutex
-
 type PendingChunk struct {
 	chunkId  string
 	sendType int
 }
 
-type PendingChunks struct {
-	infos map[PendingChunk][]string
-	adds  map[string]string
 // SendingTask represent all Chunk sending jobs given by the master in one heartbeat.
 type SendingTask struct {
 	// Infos key: Chunk' id; value: slice of DataNode' id
-	Infos map[string][]string `json:"infos"`
+	Infos map[PendingChunk][]string `json:"infos"`
 	// Adds key: DataNode' id; value: DataNode' address
 	Adds map[string]string `json:"adds"`
 }
