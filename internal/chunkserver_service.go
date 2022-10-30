@@ -399,6 +399,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		DNInfo.IncIOLoad()
 		file, err := os.Open(common.ChunkStoragePath + info.ChunkId)
 		if err != nil {
+			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
 			return
