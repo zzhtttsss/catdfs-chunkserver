@@ -46,10 +46,12 @@ func RegisterDataNode() *DataNodeInfo {
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:       res.Id,
-		Conn:     conn,
-		ioLoad:   ioLoad,
-		taskChan: make(chan *SendingTask),
+		Id:              res.Id,
+		Conn:            conn,
+		ioLoad:          ioLoad,
+		taskChan:        make(chan *SendingTask),
+		pendingChunkNum: int(res.PendingCount),
+		IsReady:         false,
 	}
 }
 
@@ -82,13 +84,14 @@ func Heartbeat() {
 		err := retry.Do(func() error {
 			failChunkInfos, successChunkInfos := HandleSendResult()
 			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-			//TODO 10/29 判断Chunk是否满足条件，允许该cs运行
+			chunkIds := GetAllChunkIds()
 			heartbeatArgs := &pb.HeartbeatArgs{
 				Id:                DNInfo.Id,
-				ChunkId:           GetAllChunkIds(),
+				ChunkId:           chunkIds,
 				IOLoad:            DNInfo.GetIOLoad(),
 				SuccessChunkInfos: successChunkInfos,
 				FailChunkInfos:    failChunkInfos,
+				IsReady:           len(chunkIds) > int(float32(DNInfo.pendingChunkNum)*0.8),
 			}
 			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
@@ -332,8 +335,8 @@ func ConsumeSendingTasks() {
 				consumeSingleChunk(infoChan, resultChan)
 			}()
 		}
-		for id, dnId := range chunks.Infos {
-			chunkId := id
+		for pc, dnId := range chunks.Infos {
+			chunkId := pc.chunkId
 			dataNodeIds := dnId
 			adds := make([]string, 0, len(dataNodeIds))
 			for i := 0; i < len(dataNodeIds); i++ {
@@ -350,10 +353,7 @@ func ConsumeSendingTasks() {
 				ChunkId:     chunkId,
 				DataNodeIds: dataNodeIds,
 				Adds:        adds,
-				chunkId:     chunkId,
-				dataNodeIds: dataNodeIds,
-				adds:        adds,
-				sendType:    pc.sendType,
+				SendType:    pc.sendType,
 			}
 		}
 		wg.Wait()
@@ -379,10 +379,7 @@ type ChunkSendInfo struct {
 	ChunkId     string   `json:"chunk_id"`
 	DataNodeIds []string `json:"data_node_ids"`
 	Adds        []string `json:"adds"`
-	chunkId     string
-	dataNodeIds []string
-	adds        []string
-	sendType    int
+	SendType    int      `json:"send_type"`
 }
 
 // consumeSingleChunk establishes a pipeline, sends a Chunk to all target chunkserver
@@ -393,20 +390,13 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			ChunkId:          info.ChunkId,
 			FailDataNodes:    info.DataNodeIds,
 			SuccessDataNodes: info.DataNodeIds[0:0],
+			SendType:         info.SendType,
 		}
 		if info.stream == nil {
 			resultChan <- defaultSingleResult
 			return
 		}
 		DNInfo.IncIOLoad()
-
-		defaultSingleResult := &util.ChunkSendResult{
-			ChunkId:          info.chunkId,
-			FailDataNodes:    info.dataNodeIds,
-			SuccessDataNodes: info.dataNodeIds[0:0],
-			SendType:         info.sendType,
-		}
-		file, err := os.Open(fmt.Sprintf("./chunks/%s", info.chunkId))
 		file, err := os.Open(common.ChunkStoragePath + info.ChunkId)
 		if err != nil {
 			//TODO 出现错误没有处理
@@ -427,10 +417,9 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 					file.Close()
 					return
 				}
-				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds)
+				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
 				DNInfo.DecIOLoad()
 				file.Close()
-				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds, info.sendType)
 				return
 			}
 			err = info.stream.Send(&pb.PieceOfChunk{
@@ -450,10 +439,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			file.Close()
 			return
 		}
-		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.dataNodeIds, info.adds, info.sendType)
-		DNInfo.DecIOLoad()
-		file.Close()
-		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds)
+		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
 		DNInfo.DecIOLoad()
 		file.Close()
 	}
