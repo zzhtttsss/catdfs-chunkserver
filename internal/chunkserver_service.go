@@ -361,10 +361,10 @@ func ConsumeSendingTasks() {
 		var newFailSendResult = make(map[string][]string)
 		var newSuccessSendResult = make(map[string][]string)
 		for result := range resultChan {
-			if result.SendType == common.Copy {
+			if result.SendType == common.CopySendType {
 				newFailSendResult[result.ChunkId] = result.FailDataNodes
 				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
-			} else if result.SendType == common.Move {
+			} else if result.SendType == common.MoveSendType {
 				newFailSendResult[result.ChunkId] = []string{}
 				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
 				go removeChunkById(result.ChunkId)
