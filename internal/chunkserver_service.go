@@ -91,7 +91,7 @@ func Heartbeat() {
 				IOLoad:            DNInfo.GetIOLoad(),
 				SuccessChunkInfos: successChunkInfos,
 				FailChunkInfos:    failChunkInfos,
-				IsReady:           len(chunkIds) > int(float32(DNInfo.pendingChunkNum)*0.8),
+				IsReady:           len(chunkIds) >= int(float32(DNInfo.pendingChunkNum)*0.8),
 			}
 			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
