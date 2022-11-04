@@ -17,8 +17,8 @@ type DataNodeInfo struct {
 	ioLoad atomic.Int64
 	// taskChan is used to cache all incoming SendingTask.
 	taskChan chan *SendingTask
-	//pendingChunkNum means the number of pending chunks in expansion operation
-	pendingChunkNum int
+	//futureChunkNum means the number of pending chunks in expansion operation
+	futureChunkNum int
 	// IsReady represents this datanode is ready to serve with master.
 	IsReady bool
 }

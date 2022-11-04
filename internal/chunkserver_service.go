@@ -46,12 +46,12 @@ func RegisterDataNode() *DataNodeInfo {
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:              res.Id,
-		Conn:            conn,
-		ioLoad:          ioLoad,
-		taskChan:        make(chan *SendingTask),
-		pendingChunkNum: int(res.PendingCount),
-		IsReady:         false,
+		Id:             res.Id,
+		Conn:           conn,
+		ioLoad:         ioLoad,
+		taskChan:       make(chan *SendingTask),
+		futureChunkNum: int(res.PendingCount),
+		IsReady:        res.PendingCount == 0,
 	}
 }
 
@@ -91,7 +91,10 @@ func Heartbeat() {
 				IOLoad:            DNInfo.GetIOLoad(),
 				SuccessChunkInfos: successChunkInfos,
 				FailChunkInfos:    failChunkInfos,
-				IsReady:           len(chunkIds) >= int(float32(DNInfo.pendingChunkNum)*0.8),
+				IsReady:           len(chunkIds) >= int(float32(DNInfo.futureChunkNum)*0.8),
+			}
+			if heartbeatArgs.IsReady {
+				DNInfo.futureChunkNum = 0
 			}
 			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
@@ -101,11 +104,15 @@ func Heartbeat() {
 				return err
 			}
 			if len(heartbeatReply.ChunkInfos) != 0 {
-				// 存储一个chunk要去哪些DataNode
+				// Store the destination of pending chunk
 				infosMap := make(map[PendingChunk][]string)
-				// 存储一个DataNode对应的Address地址
+				// Store the address of datanode
 				addsMap := make(map[string]string)
 				for i, info := range heartbeatReply.ChunkInfos {
+					if info.SendType == common.DeleteSendType {
+						removeChunkById(info.ChunkId)
+						continue
+					}
 					pc := PendingChunk{
 						chunkId:  info.ChunkId,
 						sendType: int(info.SendType),
@@ -365,9 +372,8 @@ func ConsumeSendingTasks() {
 				newFailSendResult[result.ChunkId] = result.FailDataNodes
 				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
 			} else if result.SendType == common.MoveSendType {
-				newFailSendResult[result.ChunkId] = []string{}
 				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
-				go removeChunkById(result.ChunkId)
+				removeChunkById(result.ChunkId)
 			}
 		}
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
@@ -446,5 +452,9 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 }
 
 func removeChunkById(chunkId string) {
-	_ = os.Remove(fmt.Sprintf("./chunks/%s", chunkId))
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
+	if node, ok := chunksMap[chunkId]; ok {
+		node.IsComplete = false
+	}
 }
