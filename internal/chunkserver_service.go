@@ -34,15 +34,16 @@ func RegisterDataNode() *DataNodeInfo {
 	conn, _ := getMasterConn()
 	c := pb.NewRegisterServiceClient(conn)
 	ctx := context.Background()
+	localChunksId := getLocalChunksId()
 	res, err := c.Register(ctx, &pb.DNRegisterArgs{
-		ChunkIds: getLocalChunksId(),
+		ChunkIds: localChunksId,
 	})
 	if err != nil {
 		logrus.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
 		// Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
 		// Todo 错误可能是因为master的leader正好挂了，所以可以重新获取leader地址来重试
 	}
-	logrus.Infof("Register Success,get ID: %s", res.Id)
+	logrus.Infof("Register Success, get ID: %s, get pandingCount: %d", res.Id, res.PendingCount)
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
@@ -51,7 +52,7 @@ func RegisterDataNode() *DataNodeInfo {
 		ioLoad:         ioLoad,
 		taskChan:       make(chan *SendingTask),
 		futureChunkNum: int(res.PendingCount),
-		IsReady:        res.PendingCount == 0,
+		IsReady:        res.PendingCount == uint32(len(localChunksId)),
 	}
 }
 
@@ -97,6 +98,7 @@ func Heartbeat() {
 			if heartbeatArgs.IsReady {
 				DNInfo.futureChunkNum = 0
 			}
+			fmt.Println("Send heartbeat", heartbeatArgs.IsReady)
 			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 			if err != nil {
 				conn, _ := getMasterConn()
@@ -105,11 +107,13 @@ func Heartbeat() {
 				return err
 			}
 			if len(heartbeatReply.ChunkInfos) != 0 {
+				logrus.Infof("Some chunks need to be proceed.")
 				// Store the destination of pending chunk
 				infosMap := make(map[PendingChunk][]string)
 				// Store the address of datanode
 				addsMap := make(map[string]string)
 				for i, info := range heartbeatReply.ChunkInfos {
+					logrus.Infof("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
 					if info.SendType == common.DeleteSendType {
 						removeChunkById(info.ChunkId)
 						continue
