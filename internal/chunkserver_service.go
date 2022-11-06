@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,7 +85,7 @@ func Heartbeat() {
 	for {
 		failChunkInfos, successChunkInfos := HandleSendResult()
 		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-		chunkIds := getLocalChunksId()
+		chunkIds := GetAllChunkIds()
 		isReadyThreshold := int(float64(DNInfo.futureChunkNum) * viper.GetFloat64(common.ChunkReadyThreshold))
 		heartbeatArgs := &pb.HeartbeatArgs{
 			Id:                DNInfo.Id,
@@ -323,9 +324,20 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 
 // getLocalChunksId walks through the chunk directory and get all chunks names.
 func getLocalChunksId() []string {
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
 	var chunksId []string
 	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
 		if info != nil && !info.IsDir() && !strings.HasSuffix(info.Name(), inCompleteFileSuffix) {
+			infos := strings.Split(info.Name(), common.ChunkIdDelimiter)
+			index, _ := strconv.Atoi(infos[1])
+			chunksMap[info.Name()] = &Chunk{
+				Id:         info.Name(),
+				FileId:     infos[0],
+				Index:      index,
+				IsComplete: true,
+				AddTime:    info.ModTime(),
+			}
 			chunksId = append(chunksId, info.Name())
 		}
 		return nil
