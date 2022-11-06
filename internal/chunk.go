@@ -67,16 +67,6 @@ func GetAllChunkIds() []string {
 	return ids
 }
 
-func GetFinishedChunkIds() []string {
-	updateChunksLock.RLock()
-	defer updateChunksLock.RUnlock()
-	ids := make([]string, 0)
-	for id := range chunksMap {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
 // MonitorChunks runs in a goroutine. It keeps looping to clear all incomplete
 // and timed out Chunk.
 func MonitorChunks() {
@@ -93,5 +83,15 @@ func MonitorChunks() {
 		}
 		updateChunksLock.Unlock()
 		time.Sleep(time.Duration(viper.GetInt(common.ChunkCheckTime)) * time.Second)
+	}
+}
+
+func BatchRemoveChunkById(chunkIds []string) {
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
+	for _, chunkId := range chunkIds {
+		if node, ok := chunksMap[chunkId]; ok {
+			node.IsComplete = false
+		}
 	}
 }

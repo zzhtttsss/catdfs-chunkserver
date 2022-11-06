@@ -81,8 +81,8 @@ func getMasterConn() (*grpc.ClientConn, error) {
 // the information which Chunk need to be transferred next and put the information
 // into the taskChan.
 func Heartbeat() {
-	errCount := 0
 	for {
+		errCount := 0
 		failChunkInfos, successChunkInfos := HandleSendResult()
 		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
 		chunkIds := GetAllChunkIds()
@@ -113,6 +113,7 @@ func Heartbeat() {
 			infosMap := make(map[PendingChunk][]string)
 			// Store the address of datanode
 			addsMap := make(map[string]string)
+			removedChunks := make([]string, 0)
 			updateMapLock.Lock()
 			for i, info := range heartbeatReply.ChunkInfos {
 				logrus.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
@@ -126,7 +127,7 @@ func Heartbeat() {
 					} else {
 						successSendResult[pc] = dataNodeIds
 					}
-					removeChunkById(info.ChunkId)
+					removedChunks = append(removedChunks, info.ChunkId)
 					continue
 				}
 				dataNodeIds, ok := infosMap[pc]
@@ -142,6 +143,7 @@ func Heartbeat() {
 				Infos: infosMap,
 				Adds:  addsMap,
 			})
+			BatchRemoveChunkById(removedChunks)
 		}
 		if errCount >= heartbeatRetryTime {
 			logrus.Fatalf("[Id=%s] disconnected", DNInfo.Id)
@@ -390,6 +392,7 @@ func ConsumeSendingTasks() {
 		close(resultChan)
 		var newFailSendResult = make(map[PendingChunk][]string)
 		var newSuccessSendResult = make(map[PendingChunk][]string)
+		var removedChunkIds = make([]string, 0)
 		for result := range resultChan {
 			newSuccessSendResult[PendingChunk{
 				chunkId:  result.ChunkId,
@@ -402,10 +405,11 @@ func ConsumeSendingTasks() {
 				}] = result.FailDataNodes
 			} else if result.SendType == common.MoveSendType {
 				logrus.Debugf("Delete Chunk: %s", result.ChunkId)
-				removeChunkById(result.ChunkId)
+				removedChunkIds = append(removedChunkIds, result.ChunkId)
 			}
 		}
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
+		BatchRemoveChunkById(removedChunkIds)
 	}
 }
 
@@ -476,13 +480,5 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
 		DNInfo.DecIOLoad()
 		file.Close()
-	}
-}
-
-func removeChunkById(chunkId string) {
-	updateChunksLock.Lock()
-	defer updateChunksLock.Unlock()
-	if node, ok := chunksMap[chunkId]; ok {
-		node.IsComplete = false
 	}
 }
