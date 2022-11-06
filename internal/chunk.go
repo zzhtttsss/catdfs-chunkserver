@@ -59,10 +59,7 @@ func GetChunk(id string) *Chunk {
 
 func GetAllChunkIds() []string {
 	updateChunksLock.RLock()
-	defer func() {
-		updateChunksLock.RUnlock()
-	}()
-
+	defer updateChunksLock.RUnlock()
 	ids := make([]string, 0, len(chunksMap))
 	for id := range chunksMap {
 		ids = append(ids, id)
@@ -86,5 +83,15 @@ func MonitorChunks() {
 		}
 		updateChunksLock.Unlock()
 		time.Sleep(time.Duration(viper.GetInt(common.ChunkCheckTime)) * time.Second)
+	}
+}
+
+func BatchRemoveChunkById(chunkIds []string) {
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
+	for _, chunkId := range chunkIds {
+		if node, ok := chunksMap[chunkId]; ok {
+			node.IsComplete = false
+		}
 	}
 }

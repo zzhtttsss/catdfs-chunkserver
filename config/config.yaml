@@ -15,6 +15,7 @@ chunk:
     path: "./chunks/"
     checkTime: 600
     chunkDeadTime: 600
+  readyThreshold: 0.8
 
 # etcd config
 etcd:
