@@ -13,7 +13,7 @@ chunk:
    sendTime: 5        # 每隔5s发送一次
   storage:
     path: "./chunks/"
-    checkTime: 60
+    checkTime: 600
     chunkDeadTime: 600
   readyThreshold: 0.8
 

@@ -59,11 +59,18 @@ func GetChunk(id string) *Chunk {
 
 func GetAllChunkIds() []string {
 	updateChunksLock.RLock()
-	defer func() {
-		updateChunksLock.RUnlock()
-	}()
-
+	defer updateChunksLock.RUnlock()
 	ids := make([]string, 0, len(chunksMap))
+	for id := range chunksMap {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func GetFinishedChunkIds() []string {
+	updateChunksLock.RLock()
+	defer updateChunksLock.RUnlock()
+	ids := make([]string, 0)
 	for id := range chunksMap {
 		ids = append(ids, id)
 	}

@@ -26,12 +26,12 @@ type DataNodeInfo struct {
 var (
 	// failSendResult contains all fail results of SendingTask that have been completed
 	// but not notified to the master.
-	// key: Chunk' id; value: slice of DataNode' id
-	failSendResult = make(map[string][]string)
+	// key: Chunk' id and sendType; value: slice of DataNode' id
+	failSendResult = make(map[PendingChunk][]string)
 	// successSendResult contains all success results of SendingTask that have been
 	// completed but not notified to the master.
-	// key: Chunk' id; value: slice of DataNode' id
-	successSendResult = make(map[string][]string)
+	// key: Chunk' id and sendType; value: slice of DataNode' id
+	successSendResult = make(map[PendingChunk][]string)
 	updateMapLock     = &sync.RWMutex{}
 )
 
@@ -64,22 +64,22 @@ func (d *DataNodeInfo) Add2chan(chunks *SendingTask) {
 	d.taskChan <- chunks
 }
 
-func Merge2SendResult(newFailSendResult map[string][]string, newSuccessSendResult map[string][]string) {
+func Merge2SendResult(newFailSendResult map[PendingChunk][]string, newSuccessSendResult map[PendingChunk][]string) {
 	updateMapLock.Lock()
 	defer updateMapLock.Unlock()
-	for chunkId, dnIds := range newFailSendResult {
-		if dataNodeIds, ok := failSendResult[chunkId]; ok {
+	for pc, dnIds := range newFailSendResult {
+		if dataNodeIds, ok := failSendResult[pc]; ok {
 			dataNodeIds = append(dataNodeIds, dnIds...)
 		} else {
-			failSendResult[chunkId] = dnIds
+			failSendResult[pc] = dnIds
 		}
 	}
 
-	for chunkId, dnIds := range newSuccessSendResult {
-		if dataNodeIds, ok := successSendResult[chunkId]; ok {
+	for pc, dnIds := range newSuccessSendResult {
+		if dataNodeIds, ok := successSendResult[pc]; ok {
 			dataNodeIds = append(dataNodeIds, dnIds...)
 		} else {
-			successSendResult[chunkId] = dnIds
+			successSendResult[pc] = dnIds
 		}
 	}
 }
@@ -91,23 +91,43 @@ func HandleSendResult() ([]*pb.ChunkInfo, []*pb.ChunkInfo) {
 	defer updateMapLock.Unlock()
 	failChunkInfos := make([]*pb.ChunkInfo, 0)
 	successChunkInfos := make([]*pb.ChunkInfo, 0)
-	for chunkId, dataNodeIds := range failSendResult {
-		for _, id := range dataNodeIds {
-			failChunkInfos = append(failChunkInfos, &pb.ChunkInfo{
-				ChunkId:    chunkId,
-				DataNodeId: id,
-			})
-		}
-	}
-	for chunkId, dataNodeIds := range successSendResult {
-		for _, id := range dataNodeIds {
+	for pc, dataNodeIds := range failSendResult {
+		if dataNodeIds == nil || len(dataNodeIds) == 0 {
 			successChunkInfos = append(successChunkInfos, &pb.ChunkInfo{
-				ChunkId:    chunkId,
-				DataNodeId: id,
+				ChunkId:    pc.chunkId,
+				DataNodeId: "",
+				SendType:   int32(pc.sendType),
 			})
+		} else {
+			for _, id := range dataNodeIds {
+				failChunkInfos = append(failChunkInfos, &pb.ChunkInfo{
+					ChunkId:    pc.chunkId,
+					DataNodeId: id,
+					SendType:   int32(pc.sendType),
+				})
+			}
 		}
+
 	}
-	failSendResult = make(map[string][]string)
-	successSendResult = make(map[string][]string)
+	for pc, dataNodeIds := range successSendResult {
+		if dataNodeIds == nil || len(dataNodeIds) == 0 {
+			successChunkInfos = append(successChunkInfos, &pb.ChunkInfo{
+				ChunkId:    pc.chunkId,
+				DataNodeId: "",
+				SendType:   int32(pc.sendType),
+			})
+		} else {
+			for _, id := range dataNodeIds {
+				successChunkInfos = append(successChunkInfos, &pb.ChunkInfo{
+					ChunkId:    pc.chunkId,
+					DataNodeId: id,
+					SendType:   int32(pc.sendType),
+				})
+			}
+		}
+
+	}
+	failSendResult = make(map[PendingChunk][]string)
+	successSendResult = make(map[PendingChunk][]string)
 	return failChunkInfos, successChunkInfos
 }

@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"github.com/avast/retry-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -81,64 +80,71 @@ func getMasterConn() (*grpc.ClientConn, error) {
 // the information which Chunk need to be transferred next and put the information
 // into the taskChan.
 func Heartbeat() {
+	errCount := 0
 	for {
-		err := retry.Do(func() error {
-			failChunkInfos, successChunkInfos := HandleSendResult()
-			c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
-			chunkIds := GetAllChunkIds()
-			isReadyThreshold := int(float64(DNInfo.futureChunkNum) * viper.GetFloat64(common.ChunkReadyThreshold))
-			heartbeatArgs := &pb.HeartbeatArgs{
-				Id:                DNInfo.Id,
-				ChunkId:           chunkIds,
-				IOLoad:            DNInfo.GetIOLoad(),
-				SuccessChunkInfos: successChunkInfos,
-				FailChunkInfos:    failChunkInfos,
-				IsReady:           len(chunkIds) >= isReadyThreshold,
-			}
-			if heartbeatArgs.IsReady {
-				DNInfo.futureChunkNum = 0
-			}
-			fmt.Println("Send heartbeat", heartbeatArgs.IsReady)
-			heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
-			if err != nil {
-				conn, _ := getMasterConn()
-				_ = DNInfo.Conn.Close()
-				DNInfo.Conn = conn
-				return err
-			}
-			if len(heartbeatReply.ChunkInfos) != 0 {
-				logrus.Infof("Some chunks need to be proceed.")
-				// Store the destination of pending chunk
-				infosMap := make(map[PendingChunk][]string)
-				// Store the address of datanode
-				addsMap := make(map[string]string)
-				for i, info := range heartbeatReply.ChunkInfos {
-					logrus.Infof("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
-					if info.SendType == common.DeleteSendType {
-						removeChunkById(info.ChunkId)
-						continue
-					}
-					pc := PendingChunk{
-						chunkId:  info.ChunkId,
-						sendType: int(info.SendType),
-					}
-					dataNodeIds, ok := infosMap[pc]
-					addsMap[info.DataNodeId] = heartbeatReply.DataNodeAddress[i]
-					if ok {
-						dataNodeIds = append(dataNodeIds, info.DataNodeId)
-					} else {
-						infosMap[pc] = []string{info.DataNodeId}
-					}
-				}
-				DNInfo.Add2chan(&SendingTask{
-					Infos: infosMap,
-					Adds:  addsMap,
-				})
-			}
-			return nil
-		}, retry.Attempts(heartbeatRetryTime), retry.Delay(time.Second*5))
+		failChunkInfos, successChunkInfos := HandleSendResult()
+		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
+		chunkIds := getLocalChunksId()
+		isReadyThreshold := int(float64(DNInfo.futureChunkNum) * viper.GetFloat64(common.ChunkReadyThreshold))
+		heartbeatArgs := &pb.HeartbeatArgs{
+			Id:                DNInfo.Id,
+			ChunkId:           chunkIds,
+			IOLoad:            DNInfo.GetIOLoad(),
+			SuccessChunkInfos: successChunkInfos,
+			FailChunkInfos:    failChunkInfos,
+			IsReady:           len(chunkIds) >= isReadyThreshold,
+		}
+		if heartbeatArgs.IsReady {
+			DNInfo.futureChunkNum = 0
+		}
+		logrus.Infof("Send heartbeat.This cs is ready? %v", heartbeatArgs.IsReady)
+		heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 		if err != nil {
-			logrus.Fatalf("[Id=%s] Reconnect failed. Offline.\n", DNInfo.Id)
+			logrus.Warnln("Heartbeat send failed.Try to reconnect.")
+			conn, _ := getMasterConn()
+			_ = DNInfo.Conn.Close()
+			DNInfo.Conn = conn
+			errCount++
+		}
+		if len(heartbeatReply.ChunkInfos) != 0 {
+			logrus.Debugf("Some chunks need to be proceed.")
+			// Store the destination of pending chunk
+			infosMap := make(map[PendingChunk][]string)
+			// Store the address of datanode
+			addsMap := make(map[string]string)
+			updateMapLock.Lock()
+			for i, info := range heartbeatReply.ChunkInfos {
+				logrus.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
+				pc := PendingChunk{
+					chunkId:  info.ChunkId,
+					sendType: int(info.SendType),
+				}
+				if info.SendType == common.DeleteSendType {
+					if dataNodeIds, ok := successSendResult[pc]; ok {
+						dataNodeIds = append(dataNodeIds, dataNodeIds...)
+					} else {
+						successSendResult[pc] = dataNodeIds
+					}
+					removeChunkById(info.ChunkId)
+					continue
+				}
+				dataNodeIds, ok := infosMap[pc]
+				addsMap[info.DataNodeId] = heartbeatReply.DataNodeAddress[i]
+				if ok {
+					dataNodeIds = append(dataNodeIds, info.DataNodeId)
+				} else {
+					infosMap[pc] = []string{info.DataNodeId}
+				}
+			}
+			updateMapLock.Unlock()
+			DNInfo.Add2chan(&SendingTask{
+				Infos: infosMap,
+				Adds:  addsMap,
+			})
+		}
+		if errCount >= heartbeatRetryTime {
+			logrus.Fatalf("[Id=%s] disconnected", DNInfo.Id)
+			break
 		}
 		time.Sleep(time.Second * time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)))
 	}
@@ -161,7 +167,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 	AddPendingChunk(chunkId)
 	defer func() {
-		logrus.Infof("chunk: %s, failAdds: %v", chunkId, failAdds)
+		logrus.Debugf("chunk: %s, failAdds: %v", chunkId, failAdds)
 		currentReply := &pb.TransferChunkReply{
 			ChunkId:  chunkId,
 			FailAdds: failAdds,
@@ -294,7 +300,7 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
-	file, err := os.Open(fmt.Sprintf("./chunks/%s", chunkId))
+	file, err := os.Open(fmt.Sprintf("%s%s", viper.GetString(common.ChunkStoragePath), chunkId))
 	defer file.Close()
 	if err != nil {
 		return err
@@ -319,7 +325,7 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 func getLocalChunksId() []string {
 	var chunksId []string
 	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
-		if info != nil && !info.IsDir() {
+		if info != nil && !info.IsDir() && !strings.HasSuffix(info.Name(), inCompleteFileSuffix) {
 			chunksId = append(chunksId, info.Name())
 		}
 		return nil
@@ -370,14 +376,20 @@ func ConsumeSendingTasks() {
 		}
 		wg.Wait()
 		close(resultChan)
-		var newFailSendResult = make(map[string][]string)
-		var newSuccessSendResult = make(map[string][]string)
+		var newFailSendResult = make(map[PendingChunk][]string)
+		var newSuccessSendResult = make(map[PendingChunk][]string)
 		for result := range resultChan {
+			newSuccessSendResult[PendingChunk{
+				chunkId:  result.ChunkId,
+				sendType: result.SendType,
+			}] = result.SuccessDataNodes
 			if result.SendType == common.CopySendType {
-				newFailSendResult[result.ChunkId] = result.FailDataNodes
-				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
+				newFailSendResult[PendingChunk{
+					chunkId:  result.ChunkId,
+					sendType: result.SendType,
+				}] = result.FailDataNodes
 			} else if result.SendType == common.MoveSendType {
-				newSuccessSendResult[result.ChunkId] = result.SuccessDataNodes
+				logrus.Debugf("Delete Chunk: %s", result.ChunkId)
 				removeChunkById(result.ChunkId)
 			}
 		}
@@ -408,7 +420,7 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			return
 		}
 		DNInfo.IncIOLoad()
-		file, err := os.Open(common.ChunkStoragePath + info.ChunkId)
+		file, err := os.Open(viper.GetString(common.ChunkStoragePath) + info.ChunkId)
 		if err != nil {
 			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
@@ -424,7 +436,6 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 				if err != nil {
 					DNInfo.DecIOLoad()
 					resultChan <- defaultSingleResult
-					DNInfo.DecIOLoad()
 					file.Close()
 					return
 				}
