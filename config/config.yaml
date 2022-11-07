@@ -16,6 +16,14 @@ chunk:
     checkTime: 600
     chunkDeadTime: 600
   readyThreshold: 0.8
+  # PanicLevel Level = 0
+  #	FatalLevel = 1
+  #	ErrorLevel = 2
+  #	WarnLevel = 3
+  #	InfoLevel = 4
+  #	DebugLevel = 5
+  #	TraceLevel = 6
+  logLevel: 4
 
 # etcd config
 etcd:
