@@ -23,7 +23,7 @@ chunk:
   #	InfoLevel = 4
   #	DebugLevel = 5
   #	TraceLevel = 6
-  logLevel: 4
+  logLevel: 5
 
 # etcd config
 etcd:

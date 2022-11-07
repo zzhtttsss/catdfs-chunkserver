@@ -31,7 +31,7 @@ type ChunkServerHandler struct {
 func CreateGlobalChunkServerHandler() {
 	var err error
 	Logger = config.InitLogger(Logger, true)
-	Logger.SetLevel(logrus.Level(viper.GetInt(common.MasterLogLevel)))
+	Logger.SetLevel(logrus.Level(viper.GetInt(common.ChunkLogLevel)))
 	GlobalChunkServerHandler = &ChunkServerHandler{}
 	GlobalChunkServerHandler.EtcdClient, err = clientv3.New(clientv3.Config{
 		Endpoints:   []string{viper.GetString(common.EtcdEndPoint)},
