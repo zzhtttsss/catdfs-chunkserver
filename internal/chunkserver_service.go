@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
@@ -39,11 +38,11 @@ func RegisterDataNode() *DataNodeInfo {
 		ChunkIds: localChunksId,
 	})
 	if err != nil {
-		logrus.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
+		Logger.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
 		// Todo 根据错误类型进行重试（当前master的register不会报错，所以err直接panic并重启即可）
 		// Todo 错误可能是因为master的leader正好挂了，所以可以重新获取leader地址来重试
 	}
-	logrus.Infof("Register Success, get ID: %s, get pandingCount: %d", res.Id, res.PendingCount)
+	Logger.Infof("Register Success, get ID: %s, get pandingCount: %d", res.Id, res.PendingCount)
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
@@ -62,15 +61,15 @@ func getMasterConn() (*grpc.ClientConn, error) {
 	kv := clientv3.NewKV(GlobalChunkServerHandler.EtcdClient)
 	getResp, err := kv.Get(ctx, common.LeaderAddressKey)
 	if err != nil {
-		logrus.Errorf("Fail to get kv when init, error detail: %s", err.Error())
+		Logger.Errorf("Fail to get kv when init, error detail: %s", err.Error())
 		return nil, err
 	}
 	addr := string(getResp.Kvs[0].Value)
 	addr = strings.Split(addr, common.AddressDelimiter)[0] + viper.GetString(common.MasterPort)
-	logrus.Infof("leader master address is: %s", addr)
+	Logger.Debugf("Leader master address is: %s", addr)
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		logrus.Errorf("Fail to get connection to leader , error detail: %s", err.Error())
+		Logger.Errorf("Fail to get connection to leader , error detail: %s", err.Error())
 		return nil, err
 	}
 	return conn, nil
@@ -98,17 +97,18 @@ func Heartbeat() {
 		if heartbeatArgs.IsReady {
 			DNInfo.futureChunkNum = 0
 		}
-		logrus.Infof("Send heartbeat.This cs is ready? %v", heartbeatArgs.IsReady)
+		Logger.Debugf("Send heartbeat, isReady: %v", heartbeatArgs.IsReady)
 		heartbeatReply, err := c.Heartbeat(context.Background(), heartbeatArgs)
 		if err != nil {
-			logrus.Warnln("Heartbeat send failed.Try to reconnect.")
+			Logger.Warnf("Heartbeat send failed, have tried to reconnect %v time.", errCount)
 			conn, _ := getMasterConn()
 			_ = DNInfo.Conn.Close()
 			DNInfo.Conn = conn
 			errCount++
 		}
+		errCount = 0
 		if len(heartbeatReply.ChunkInfos) != 0 {
-			logrus.Debugf("Some chunks need to be proceed.")
+			Logger.Debugf("Some chunks need to be proceed.")
 			// Store the destination of pending chunk
 			infosMap := make(map[PendingChunk][]string)
 			// Store the address of datanode
@@ -116,7 +116,7 @@ func Heartbeat() {
 			removedChunks := make([]string, 0)
 			updateMapLock.Lock()
 			for i, info := range heartbeatReply.ChunkInfos {
-				logrus.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
+				Logger.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
 				pc := PendingChunk{
 					chunkId:  info.ChunkId,
 					sendType: int(info.SendType),
@@ -146,7 +146,7 @@ func Heartbeat() {
 			BatchRemoveChunkById(removedChunks)
 		}
 		if errCount >= heartbeatRetryTime {
-			logrus.Fatalf("[Id=%s] disconnected", DNInfo.Id)
+			Logger.Fatalf("[Id=%s] disconnected", DNInfo.Id)
 			break
 		}
 		time.Sleep(time.Second * time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)))
@@ -170,7 +170,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 	AddPendingChunk(chunkId)
 	defer func() {
-		logrus.Debugf("chunk: %s, failAdds: %v", chunkId, failAdds)
+		Logger.Debugf("Chunk: %s, failAdds: %v", chunkId, failAdds)
 		currentReply := &pb.TransferChunkReply{
 			ChunkId:  chunkId,
 			FailAdds: failAdds,
@@ -179,7 +179,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		// If current chunkserver can not send the result to previous chunkserver, we can not get
 		// how many chunkserver have failed, so we treat this situation as a failure.
 		if err != nil {
-			logrus.Errorf("Fail to close receive stream, error detail: %s", err.Error())
+			Logger.Errorf("Fail to close receive stream, error detail: %s", err.Error())
 			isStoreSuccess = false
 		}
 		if isStoreSuccess {
@@ -190,7 +190,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		// Todo: try each address until success
 		nextStream, err = getNextStream(chunkId, addresses[1:])
 		if err != nil {
-			logrus.Errorf("Fail to get next stream, error detail: %s", err.Error())
+			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
 			failAdds = append(failAdds, addresses[1:]...)
 			nextStream = nil
@@ -215,7 +215,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			if nextStream != nil {
 				previousReply, err := nextStream.CloseAndRecv()
 				if err != nil {
-					logrus.Errorf("Fail to close send stream, error detail: %s", err.Error())
+					Logger.Errorf("Fail to close send stream, error detail: %s", err.Error())
 					failAdds = append(failAdds, addresses[1:]...)
 				} else {
 					failAdds = append(failAdds, previousReply.FailAdds...)
@@ -225,16 +225,16 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			wg.Wait()
 			if len(errChan) != 0 {
 				err = <-errChan
-				logrus.Errorf("Fail to store a chunk, error detail: %s", err.Error())
+				Logger.Errorf("Fail to store a chunk, error detail: %s", err.Error())
 				isStoreSuccess = false
 				failAdds = append(failAdds, addresses[0])
 				return err
 			}
 			isStoreSuccess = true
-			logrus.Infof("Success to store a chunk, id: %s", chunkId)
+			Logger.Infof("Success to store a chunk, id: %s", chunkId)
 			return nil
 		} else if err != nil {
-			logrus.Errorf("Fail to receive a piece from previous chunkserver, error detail: %s", err.Error())
+			Logger.Errorf("Fail to receive a piece from previous chunkserver, error detail: %s", err.Error())
 			close(pieceChan)
 			isStoreSuccess = false
 			return err
@@ -243,7 +243,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		if nextStream != nil {
 			err := nextStream.Send(pieceOfChunk)
 			if err != nil {
-				logrus.Errorf("Fail to send a piece to next chunkserver, error detail: %s", err.Error())
+				Logger.Errorf("Fail to send a piece to next chunkserver, error detail: %s", err.Error())
 				failAdds = append(failAdds, addresses[1:]...)
 				nextStream = nil
 			}
@@ -255,7 +255,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 // pipeline.
 func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
-	logrus.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
+	Logger.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
 	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
@@ -273,14 +273,14 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	defer close(errChan)
 	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId + inCompleteFileSuffix)
 	if err != nil {
-		logrus.Errorf("fail to open a chunk file, error detail: %s", err.Error())
+		Logger.Errorf("Fail to open a chunk file, error detail: %s", err.Error())
 		errChan <- err
 	}
 	defer chunkFile.Close()
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
 	for piece := range pieceChan {
 		if _, err := chunkFile.Write(piece.Piece); err != nil {
-			logrus.Errorf("fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
+			Logger.Errorf("Fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
 			errChan <- err
 			break
 		}
@@ -378,7 +378,7 @@ func ConsumeSendingTasks() {
 			if err != nil {
 				// Todo
 				stream = nil
-				logrus.Errorf("fail to get next stream, error detail: %s", err.Error())
+				Logger.Errorf("fail to get next stream, error detail: %s", err.Error())
 			}
 			infoChan <- &ChunkSendInfo{
 				stream:      stream,
@@ -404,7 +404,7 @@ func ConsumeSendingTasks() {
 					sendType: result.SendType,
 				}] = result.FailDataNodes
 			} else if result.SendType == common.MoveSendType {
-				logrus.Debugf("Delete Chunk: %s", result.ChunkId)
+				Logger.Debugf("Delete Chunk: %s", result.ChunkId)
 				removedChunkIds = append(removedChunkIds, result.ChunkId)
 			}
 		}
