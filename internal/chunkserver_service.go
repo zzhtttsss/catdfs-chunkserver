@@ -191,7 +191,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	}()
 	if len(addresses) > 1 {
 		// Todo: try each address until success
-		nextStream, err = getNextStream(chunkId, addresses[1:])
+		nextStream, err = getNextStream(chunkId, addresses[1:], chunkSize)
 		if err != nil {
 			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
@@ -257,7 +257,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 // getNextStream builds stream to transfer this chunk to next chunkserver in the
 // pipeline.
-func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
+func getNextStream(chunkId string, addresses []string, chunkSize int) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	Logger.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
 	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -267,6 +267,7 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 		newCtx = metadata.AppendToOutgoingContext(newCtx, common.AddressString, address)
 	}
 	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIdString, chunkId)
+	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkSizeString, strconv.Itoa(chunkSize))
 	return c.TransferChunk(newCtx)
 }
 
@@ -394,11 +395,16 @@ func ConsumeSendingTasks() {
 			for i := 0; i < len(dataNodeIds); i++ {
 				adds = append(adds, chunks.Adds[dataNodeIds[i]])
 			}
-			stream, err := getNextStream(chunkId, adds)
+			stat, err := os.Stat(viper.GetString(common.ChunkStoragePath) + chunkId)
+			// Let consumeSingleChunk handle this error.
+			if err != nil {
+				Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
+			}
+			stream, err := getNextStream(chunkId, adds, int(stat.Size()))
 			if err != nil {
 				// Todo
 				stream = nil
-				Logger.Errorf("fail to get next stream, error detail: %s", err.Error())
+				Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			}
 			infoChan <- &ChunkSendInfo{
 				stream:      stream,
@@ -410,9 +416,11 @@ func ConsumeSendingTasks() {
 		}
 		wg.Wait()
 		close(resultChan)
-		var newFailSendResult = make(map[PendingChunk][]string)
-		var newSuccessSendResult = make(map[PendingChunk][]string)
-		var removedChunkIds = make([]string, 0)
+		var (
+			newFailSendResult    = make(map[PendingChunk][]string)
+			newSuccessSendResult = make(map[PendingChunk][]string)
+			removedChunkIds      = make([]string, 0)
+		)
 		for result := range resultChan {
 			newSuccessSendResult[PendingChunk{
 				chunkId:  result.ChunkId,
@@ -445,6 +453,7 @@ type ChunkSendInfo struct {
 // through the pipeline and return the result by the resultChan.
 func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
 	for info := range infoChan {
+		DNInfo.IncIOLoad()
 		defaultSingleResult := &util.ChunkSendResult{
 			ChunkId:          info.ChunkId,
 			FailDataNodes:    info.DataNodeIds,
@@ -453,19 +462,21 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		}
 		if info.stream == nil {
 			resultChan <- defaultSingleResult
+			DNInfo.DecIOLoad()
 			continue
 		}
-		DNInfo.IncIOLoad()
+
 		file, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+info.ChunkId, os.O_RDWR, 0644)
-		fInfo, _ := file.Stat()
-		pieceNum := int(fInfo.Size() / common.MB)
 		if err != nil {
 			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
 			continue
 		}
+		fInfo, _ := file.Stat()
+		pieceNum := int(fInfo.Size() / common.MB)
 		buffer, _ := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
+
 		for i := 0; i < pieceNum; i++ {
 			if i == pieceNum-1 {
 				err = info.stream.Send(&pb.PieceOfChunk{
