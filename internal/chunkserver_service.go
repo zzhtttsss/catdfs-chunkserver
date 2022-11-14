@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
@@ -168,6 +169,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(common.ChunkIdString)[0]
 	addresses := md.Get(common.AddressString)
+	chunkSize, _ := strconv.Atoi(md.Get(common.ChunkSizeString)[0])
 
 	AddPendingChunk(chunkId)
 	defer func() {
@@ -198,13 +200,14 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		}
 	}
 	// Every piece of chunk will be added into pieceChan so that storeChunk function
-	// can get all pieces sequentially.
-	pieceChan := make(chan *pb.PieceOfChunk)
-	errChan := make(chan error)
+	// can get all pieces sequentially. If storeChunk occurs error and return, there
+	// will be no consumer to consume pieceChan, so we need make pieceChan has cache.
+	pieceChan := make(chan *pb.PieceOfChunk, common.ChunkMBNum)
+	errChan := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		storeChunk(pieceChan, errChan, chunkId)
+		storeChunk(pieceChan, errChan, chunkId, chunkSize)
 	}()
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
@@ -270,23 +273,38 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 // StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
 // operation is very slow, this function will be run in a goroutine to not block
 // the main thread transferring the chunk to another chunkserver.
-func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
-	defer close(errChan)
-	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix, os.O_RDWR|os.O_CREATE, 0644)
+func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string, chunkSize int) {
+	var err error
+	defer func() {
+		if err != nil {
+			Logger.Errorf("Fail to store a chunk, chunkId = %s, error detail: %s", chunkId, err.Error())
+			errChan <- err
+		}
+		close(errChan)
+	}()
+	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
+		os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		Logger.Errorf("Fail to open a chunk file, error detail: %s", err.Error())
-		errChan <- err
+		return
 	}
-	//data, _ := unix.Mmap(int(chunkFile.Fd()), 0, fileSize*64, syscall.PROT_WRITE, syscall.MAP_SHARED)
+	err = chunkFile.Truncate(int64(chunkSize))
+	if err != nil {
+		return
+	}
+	chunkData, err := unix.Mmap(int(chunkFile.Fd()), 0, chunkSize, syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return
+	}
 	defer chunkFile.Close()
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
+	index := 0
 	for piece := range pieceChan {
-		if _, err := chunkFile.Write(piece.Piece); err != nil {
-			Logger.Errorf("Fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
-			errChan <- err
-			break
+		for _, b := range piece.Piece {
+			chunkData[index] = b
+			index++
 		}
 	}
+	err = unix.Munmap(chunkData)
 }
 
 // DoSendStream2Client calls rpc to send data to client.
