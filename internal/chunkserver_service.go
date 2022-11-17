@@ -285,6 +285,7 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	}()
 	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
 		os.O_RDWR|os.O_CREATE, 0644)
+	defer chunkFile.Close()
 	if err != nil {
 		return
 	}
@@ -296,7 +297,6 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	if err != nil {
 		return
 	}
-	defer chunkFile.Close()
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
 	index := 0
 	for piece := range pieceChan {
