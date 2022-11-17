@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/viper"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
@@ -167,6 +169,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	chunkId := md.Get(common.ChunkIdString)[0]
 	addresses := md.Get(common.AddressString)
+	chunkSize, _ := strconv.Atoi(md.Get(common.ChunkSizeString)[0])
 
 	AddPendingChunk(chunkId)
 	defer func() {
@@ -188,7 +191,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	}()
 	if len(addresses) > 1 {
 		// Todo: try each address until success
-		nextStream, err = getNextStream(chunkId, addresses[1:])
+		nextStream, err = getNextStream(chunkId, addresses[1:], chunkSize)
 		if err != nil {
 			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
@@ -197,13 +200,14 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 		}
 	}
 	// Every piece of chunk will be added into pieceChan so that storeChunk function
-	// can get all pieces sequentially.
-	pieceChan := make(chan *pb.PieceOfChunk)
-	errChan := make(chan error)
+	// can get all pieces sequentially. If storeChunk occurs error and return, there
+	// will be no consumer to consume pieceChan, so we need make pieceChan has cache.
+	pieceChan := make(chan *pb.PieceOfChunk, common.ChunkMBNum)
+	errChan := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		storeChunk(pieceChan, errChan, chunkId)
+		storeChunk(pieceChan, errChan, chunkId, chunkSize)
 	}()
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
@@ -253,7 +257,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 // getNextStream builds stream to transfer this chunk to next chunkserver in the
 // pipeline.
-func getNextStream(chunkId string, addresses []string) (pb.PipLineService_TransferChunkClient, error) {
+func getNextStream(chunkId string, addresses []string, chunkSize int) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	Logger.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
 	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -263,28 +267,45 @@ func getNextStream(chunkId string, addresses []string) (pb.PipLineService_Transf
 		newCtx = metadata.AppendToOutgoingContext(newCtx, common.AddressString, address)
 	}
 	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIdString, chunkId)
+	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkSizeString, strconv.Itoa(chunkSize))
 	return c.TransferChunk(newCtx)
 }
 
 // StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
 // operation is very slow, this function will be run in a goroutine to not block
 // the main thread transferring the chunk to another chunkserver.
-func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string) {
-	defer close(errChan)
-	chunkFile, err := os.Create(viper.GetString(common.ChunkStoragePath) + chunkId + inCompleteFileSuffix)
+func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string, chunkSize int) {
+	var err error
+	defer func() {
+		if err != nil {
+			Logger.Errorf("Fail to store a chunk, chunkId = %s, error detail: %s", chunkId, err.Error())
+			errChan <- err
+		}
+		close(errChan)
+	}()
+	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
+		os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		Logger.Errorf("Fail to open a chunk file, error detail: %s", err.Error())
-		errChan <- err
+		return
 	}
 	defer chunkFile.Close()
+	err = chunkFile.Truncate(int64(chunkSize))
+	if err != nil {
+		return
+	}
+	chunkData, err := unix.Mmap(int(chunkFile.Fd()), 0, chunkSize, syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return
+	}
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
+	index := 0
 	for piece := range pieceChan {
-		if _, err := chunkFile.Write(piece.Piece); err != nil {
-			Logger.Errorf("Fail to write a piece to chunk file, chunkId = %s, error detail: %s", chunkId, err.Error())
-			errChan <- err
-			break
+		for _, b := range piece.Piece {
+			chunkData[index] = b
+			index++
 		}
 	}
+	err = unix.Munmap(chunkData)
 }
 
 // DoSendStream2Client calls rpc to send data to client.
@@ -374,11 +395,16 @@ func ConsumeSendingTasks() {
 			for i := 0; i < len(dataNodeIds); i++ {
 				adds = append(adds, chunks.Adds[dataNodeIds[i]])
 			}
-			stream, err := getNextStream(chunkId, adds)
+			stat, err := os.Stat(viper.GetString(common.ChunkStoragePath) + chunkId)
+			// Let consumeSingleChunk handle this error.
+			if err != nil {
+				Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
+			}
+			stream, err := getNextStream(chunkId, adds, int(stat.Size()))
 			if err != nil {
 				// Todo
 				stream = nil
-				Logger.Errorf("fail to get next stream, error detail: %s", err.Error())
+				Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			}
 			infoChan <- &ChunkSendInfo{
 				stream:      stream,
@@ -390,9 +416,11 @@ func ConsumeSendingTasks() {
 		}
 		wg.Wait()
 		close(resultChan)
-		var newFailSendResult = make(map[PendingChunk][]string)
-		var newSuccessSendResult = make(map[PendingChunk][]string)
-		var removedChunkIds = make([]string, 0)
+		var (
+			newFailSendResult    = make(map[PendingChunk][]string)
+			newSuccessSendResult = make(map[PendingChunk][]string)
+			removedChunkIds      = make([]string, 0)
+		)
 		for result := range resultChan {
 			newSuccessSendResult[PendingChunk{
 				chunkId:  result.ChunkId,
@@ -425,6 +453,7 @@ type ChunkSendInfo struct {
 // through the pipeline and return the result by the resultChan.
 func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
 	for info := range infoChan {
+		DNInfo.IncIOLoad()
 		defaultSingleResult := &util.ChunkSendResult{
 			ChunkId:          info.ChunkId,
 			FailDataNodes:    info.DataNodeIds,
@@ -433,52 +462,52 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		}
 		if info.stream == nil {
 			resultChan <- defaultSingleResult
-			return
+			DNInfo.DecIOLoad()
+			continue
 		}
-		DNInfo.IncIOLoad()
-		file, err := os.Open(viper.GetString(common.ChunkStoragePath) + info.ChunkId)
+
+		file, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+info.ChunkId, os.O_RDWR, 0644)
 		if err != nil {
 			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
-			return
+			continue
 		}
-		for i := 0; i < common.ChunkMBNum; i++ {
-			buffer := make([]byte, common.MB)
-			n, _ := file.Read(buffer)
+		fInfo, _ := file.Stat()
+		pieceNum := int(fInfo.Size() / common.MB)
+		buffer, _ := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
+
+		for i := 0; i < pieceNum; i++ {
+			if i == pieceNum-1 {
+				err = info.stream.Send(&pb.PieceOfChunk{
+					Piece: buffer[i*common.MB : fInfo.Size()],
+				})
+			} else {
+				err = info.stream.Send(&pb.PieceOfChunk{
+					Piece: buffer[i*common.MB : (i+1)*common.MB],
+				})
+			}
+
+			if err != nil {
+				resultChan <- defaultSingleResult
+				DNInfo.DecIOLoad()
+				file.Close()
+				break
+			}
 			// sending done
-			if n == 0 {
+			if i == pieceNum-1 {
 				transferChunkReply, err := info.stream.CloseAndRecv()
 				if err != nil {
 					DNInfo.DecIOLoad()
 					resultChan <- defaultSingleResult
 					file.Close()
-					return
+					break
 				}
 				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
 				DNInfo.DecIOLoad()
 				file.Close()
-				return
-			}
-			err = info.stream.Send(&pb.PieceOfChunk{
-				Piece: buffer[:n],
-			})
-			if err != nil {
-				resultChan <- defaultSingleResult
-				DNInfo.DecIOLoad()
-				file.Close()
-				return
 			}
 		}
-		transferChunkReply, err := info.stream.CloseAndRecv()
-		if err != nil {
-			resultChan <- defaultSingleResult
-			DNInfo.DecIOLoad()
-			file.Close()
-			return
-		}
-		resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
-		DNInfo.DecIOLoad()
-		file.Close()
+		_ = unix.Munmap(buffer)
 	}
 }
