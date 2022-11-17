@@ -3,7 +3,9 @@ package internal
 import (
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
+	"math"
 	"sync"
+	"syscall"
 	"tinydfs-base/protocol/pb"
 )
 
@@ -130,4 +132,26 @@ func HandleSendResult() ([]*pb.ChunkInfo, []*pb.ChunkInfo) {
 	failSendResult = make(map[PendingChunk][]string)
 	successSendResult = make(map[PendingChunk][]string)
 	return failChunkInfos, successChunkInfos
+}
+
+type DiskStatus struct {
+	All   int64
+	Used  int64
+	Free  int64
+	Usage int
+}
+
+// GetDiskStatus gets disk status of path/disk
+func GetDiskStatus(path string) DiskStatus {
+	var disk DiskStatus
+	fs := syscall.Statfs_t{}
+	err := syscall.Statfs(path, &fs)
+	if err != nil {
+		return disk
+	}
+	disk.All = int64(fs.Blocks * uint64(fs.Bsize))
+	disk.Free = int64(fs.Bfree * uint64(fs.Bsize))
+	disk.Used = disk.All - disk.Free
+	disk.Usage = int(math.Ceil(float64(disk.Used) / float64(disk.All) * 100))
+	return disk
 }

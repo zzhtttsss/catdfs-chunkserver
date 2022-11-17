@@ -88,10 +88,13 @@ func Heartbeat() {
 		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
 		chunkIds := GetAllChunkIds()
 		isReadyThreshold := int(float64(DNInfo.futureChunkNum) * viper.GetFloat64(common.ChunkReadyThreshold))
+		diskStatus := GetDiskStatus(viper.GetString(common.ChunkStoragePath))
 		heartbeatArgs := &pb.HeartbeatArgs{
 			Id:                DNInfo.Id,
 			ChunkId:           chunkIds,
 			IOLoad:            DNInfo.GetIOLoad(),
+			FullCapacity:      diskStatus.All,
+			UsedCapacity:      diskStatus.Used,
 			SuccessChunkInfos: successChunkInfos,
 			FailChunkInfos:    failChunkInfos,
 			IsReady:           len(chunkIds) >= isReadyThreshold,
