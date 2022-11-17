@@ -36,8 +36,11 @@ func RegisterDataNode() *DataNodeInfo {
 	c := pb.NewRegisterServiceClient(conn)
 	ctx := context.Background()
 	localChunksId := getLocalChunksId()
+	diskStatus := GetDiskStatus(viper.GetString(common.ChunkStoragePath))
 	res, err := c.Register(ctx, &pb.DNRegisterArgs{
-		ChunkIds: localChunksId,
+		ChunkIds:     localChunksId,
+		FullCapacity: diskStatus.All,
+		UsedCapacity: diskStatus.Used,
 	})
 	if err != nil {
 		Logger.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
