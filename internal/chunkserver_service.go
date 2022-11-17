@@ -285,10 +285,10 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 	}()
 	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
 		os.O_RDWR|os.O_CREATE, 0644)
-	defer chunkFile.Close()
 	if err != nil {
 		return
 	}
+	defer chunkFile.Close()
 	err = chunkFile.Truncate(int64(chunkSize))
 	if err != nil {
 		return
