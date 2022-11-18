@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
@@ -157,14 +156,14 @@ func GetDiskStatus(path string) DiskStatus {
 	//disk.Free = int64(fs.Bfree * uint64(fs.Bsize))
 	//disk.Used = disk.All - disk.Free
 	//disk.Usage = int(math.Ceil(float64(disk.Used) / float64(disk.All) * 100))
-	disk.Used = GetDirSize(path)
+	disk.Used = getDirSize(path)
 	disk.All = int64(viper.GetInt(common.ChunkCapacity))
 	disk.Usage = int(math.Ceil(float64(disk.Used) / float64(disk.All) * 100))
-	logrus.Warnf("GetDiskStatus, all: %v, used: %v. free: %v, usage: %v", disk.All, disk.Used, disk.Free, disk.Usage)
 	return disk
 }
 
-func GetDirSize(path string) int64 {
+// getDirSize get the size of a directory.
+func getDirSize(path string) int64 {
 	var size int64
 	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if !info.IsDir() {
