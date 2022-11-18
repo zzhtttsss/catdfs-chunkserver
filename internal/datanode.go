@@ -1,11 +1,15 @@
 package internal
 
 import (
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
-	"syscall"
+	"tinydfs-base/common"
 	"tinydfs-base/protocol/pb"
 )
 
@@ -144,14 +148,29 @@ type DiskStatus struct {
 // GetDiskStatus gets disk status of path/disk
 func GetDiskStatus(path string) DiskStatus {
 	var disk DiskStatus
-	fs := syscall.Statfs_t{}
-	err := syscall.Statfs(path, &fs)
-	if err != nil {
-		return disk
-	}
-	disk.All = int64(fs.Blocks * uint64(fs.Bsize))
-	disk.Free = int64(fs.Bfree * uint64(fs.Bsize))
-	disk.Used = disk.All - disk.Free
+	//fs := syscall.Statfs_t{}
+	//err := syscall.Statfs(path, &fs)
+	//if err != nil {
+	//	return disk
+	//}
+	//disk.All = int64(fs.Blocks * uint64(fs.Bsize))
+	//disk.Free = int64(fs.Bfree * uint64(fs.Bsize))
+	//disk.Used = disk.All - disk.Free
+	//disk.Usage = int(math.Ceil(float64(disk.Used) / float64(disk.All) * 100))
+	disk.Used = GetDirSize(path)
+	disk.All = int64(viper.GetInt(common.ChunkCapacity))
 	disk.Usage = int(math.Ceil(float64(disk.Used) / float64(disk.All) * 100))
+	logrus.Warnf("GetDiskStatus, all: %v, used: %v. free: %v, usage: %v", disk.All, disk.Used, disk.Free, disk.Usage)
 	return disk
+}
+
+func GetDirSize(path string) int64 {
+	var size int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return size
 }

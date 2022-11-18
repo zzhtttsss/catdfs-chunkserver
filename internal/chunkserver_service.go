@@ -115,7 +115,7 @@ func Heartbeat() {
 			errCount++
 		}
 		errCount = 0
-		if len(heartbeatReply.ChunkInfos) != 0 {
+		if heartbeatReply.ChunkInfos != nil {
 			Logger.Debugf("Some chunks need to be proceed.")
 			// Store the destination of pending chunk
 			infosMap := make(map[PendingChunk][]string)
