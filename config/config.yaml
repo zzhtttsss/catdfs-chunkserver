@@ -15,6 +15,7 @@ chunk:
     path: "./chunks/"
     checkTime: 600
     chunkDeadTime: 600
+    capacity: 2147483648
   readyThreshold: 0.8
   # PanicLevel Level = 0
   #	FatalLevel = 1

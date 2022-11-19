@@ -36,8 +36,11 @@ func RegisterDataNode() *DataNodeInfo {
 	c := pb.NewRegisterServiceClient(conn)
 	ctx := context.Background()
 	localChunksId := getLocalChunksId()
+	diskStatus := GetDiskStatus(viper.GetString(common.ChunkStoragePath))
 	res, err := c.Register(ctx, &pb.DNRegisterArgs{
-		ChunkIds: localChunksId,
+		ChunkIds:     localChunksId,
+		FullCapacity: diskStatus.All,
+		UsedCapacity: diskStatus.Used,
 	})
 	if err != nil {
 		Logger.Panicf("Fail to register, error code: %v, error detail: %s,", common.ChunkServerRegisterFailed, err.Error())
@@ -88,10 +91,13 @@ func Heartbeat() {
 		c := pb.NewHeartbeatServiceClient(DNInfo.Conn)
 		chunkIds := GetAllChunkIds()
 		isReadyThreshold := int(float64(DNInfo.futureChunkNum) * viper.GetFloat64(common.ChunkReadyThreshold))
+		diskStatus := GetDiskStatus(viper.GetString(common.ChunkStoragePath))
 		heartbeatArgs := &pb.HeartbeatArgs{
 			Id:                DNInfo.Id,
 			ChunkId:           chunkIds,
 			IOLoad:            DNInfo.GetIOLoad(),
+			FullCapacity:      diskStatus.All,
+			UsedCapacity:      diskStatus.Used,
 			SuccessChunkInfos: successChunkInfos,
 			FailChunkInfos:    failChunkInfos,
 			IsReady:           len(chunkIds) >= isReadyThreshold,
@@ -109,7 +115,7 @@ func Heartbeat() {
 			errCount++
 		}
 		errCount = 0
-		if len(heartbeatReply.ChunkInfos) != 0 {
+		if heartbeatReply.ChunkInfos != nil {
 			Logger.Debugf("Some chunks need to be proceed.")
 			// Store the destination of pending chunk
 			infosMap := make(map[PendingChunk][]string)
