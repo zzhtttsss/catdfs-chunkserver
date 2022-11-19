@@ -44,6 +44,8 @@ func AddPendingChunk(chunkId string) {
 func FinishChunk(chunkId string) {
 	_ = os.Rename(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
 		viper.GetString(common.ChunkStoragePath)+chunkId)
+	_ = os.Rename(viper.GetString(common.ChecksumStoragePath)+chunkId+checkSumFileSuffix+inCompleteFileSuffix,
+		viper.GetString(common.ChecksumStoragePath)+chunkId+checkSumFileSuffix)
 	updateChunksLock.Lock()
 	defer updateChunksLock.Unlock()
 	chunksMap[chunkId].IsComplete = true
@@ -61,8 +63,10 @@ func GetAllChunkIds() []string {
 	updateChunksLock.RLock()
 	defer updateChunksLock.RUnlock()
 	ids := make([]string, 0, len(chunksMap))
-	for id := range chunksMap {
-		ids = append(ids, id)
+	for id, chunk := range chunksMap {
+		if chunk.IsComplete {
+			ids = append(ids, id)
+		}
 	}
 	return ids
 }
@@ -74,7 +78,8 @@ func MonitorChunks() {
 		updateChunksLock.Lock()
 		for id, chunk := range chunksMap {
 			if !chunk.IsComplete && int(time.Now().Sub(chunk.AddTime).Seconds()) > viper.GetInt(common.ChunkDeadTime) {
-				err := os.Remove(common.ChunkStoragePath + chunk.Id)
+				err := os.Remove(common.ChunkStoragePath + chunk.Id + inCompleteFileSuffix)
+				err = os.Remove(common.ChunkStoragePath + chunk.Id + checkSumFileSuffix + inCompleteFileSuffix)
 				if err != nil {
 					continue
 				}

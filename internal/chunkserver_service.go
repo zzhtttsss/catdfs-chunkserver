@@ -28,6 +28,7 @@ const (
 	heartbeatRetryTime   = 5
 	maxGoroutineNum      = 5
 	inCompleteFileSuffix = "_incomplete"
+	checkSumFileSuffix   = ".crc"
 )
 
 // RegisterDataNode register this chunkserver to the master.
@@ -176,7 +177,8 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	chunkId := md.Get(common.ChunkIdString)[0]
 	addresses := md.Get(common.AddressString)
 	chunkSize, _ := strconv.Atoi(md.Get(common.ChunkSizeString)[0])
-
+	checkSums := md.Get(common.CheckSumString)
+	checkSumString := strings.Join(checkSums, "")
 	AddPendingChunk(chunkId)
 	defer func() {
 		Logger.Debugf("Chunk: %s, failAdds: %v", chunkId, failAdds)
@@ -213,11 +215,12 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		storeChunk(pieceChan, errChan, chunkId, chunkSize)
+		storeChunk(pieceChan, errChan, chunkId, chunkSize, checkSumString)
 	}()
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
 	// Receive pieces of chunk until there are no more pieces.
+	pieceIndex := 0
 	for {
 		pieceOfChunk, err = stream.Recv()
 		if err == io.EOF {
@@ -244,7 +247,13 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 			Logger.Infof("Success to store a chunk, id: %s", chunkId)
 			return nil
 		} else if err != nil {
-			Logger.Errorf("Fail to receive a piece from previous chunkserver, error detail: %s", err.Error())
+			Logger.Errorf("Fail to receive a piece from previous chunkserver or client, error detail: %s", err.Error())
+			close(pieceChan)
+			isStoreSuccess = false
+			return err
+		} else if util.CRC32String(pieceOfChunk.Piece) != checkSums[pieceIndex] {
+			err = fmt.Errorf("checksum is invalid")
+			Logger.Errorf("Fail to receive a piece from previous chunkserver or client, error detail: %s", err.Error())
 			close(pieceChan)
 			isStoreSuccess = false
 			return err
@@ -280,7 +289,7 @@ func getNextStream(chunkId string, addresses []string, chunkSize int) (pb.PipLin
 // StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
 // operation is very slow, this function will be run in a goroutine to not block
 // the main thread transferring the chunk to another chunkserver.
-func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string, chunkSize int) {
+func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string, chunkSize int, checkSumString string) {
 	var err error
 	defer func() {
 		if err != nil {
@@ -312,6 +321,16 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 		}
 	}
 	err = unix.Munmap(chunkData)
+	checkSumFile, err := os.OpenFile(viper.GetString(common.ChecksumStoragePath)+chunkId+checkSumFileSuffix+
+		inCompleteFileSuffix, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return
+	}
+	defer checkSumFile.Close()
+	_, err = checkSumFile.WriteString(checkSumString)
+	if err != nil {
+		return
+	}
 }
 
 // DoSendStream2Client calls rpc to send data to client.
