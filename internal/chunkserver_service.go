@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/spf13/viper"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -27,8 +28,9 @@ import (
 const (
 	heartbeatRetryTime   = 5
 	maxGoroutineNum      = 5
-	inCompleteFileSuffix = "_incomplete"
+	incompleteFileSuffix = "_incomplete"
 	checkSumFileSuffix   = ".crc"
+	maxCheckSumSize      = 256
 )
 
 // RegisterDataNode register this chunkserver to the master.
@@ -71,7 +73,7 @@ func getMasterConn() (*grpc.ClientConn, error) {
 		return nil, err
 	}
 	addr := string(getResp.Kvs[0].Value)
-	addr = strings.Split(addr, common.AddressDelimiter)[0] + viper.GetString(common.MasterPort)
+	addr = util.CombineString(strings.Split(addr, common.AddressDelimiter)[0], viper.GetString(common.MasterPort))
 	Logger.Debugf("Leader master address is: %s", addr)
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -101,6 +103,7 @@ func Heartbeat() {
 			UsedCapacity:      diskStatus.Used,
 			SuccessChunkInfos: successChunkInfos,
 			FailChunkInfos:    failChunkInfos,
+			InvalidChunks:     HandleInvalidChunks(),
 			IsReady:           len(chunkIds) >= isReadyThreshold,
 		}
 		if heartbeatArgs.IsReady {
@@ -199,7 +202,7 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 	}()
 	if len(addresses) > 1 {
 		// Todo: try each address until success
-		nextStream, err = getNextStream(chunkId, addresses[1:], chunkSize)
+		nextStream, err = getNextStream(chunkId, addresses[1:], chunkSize, checkSums)
 		if err != nil {
 			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
@@ -272,10 +275,11 @@ func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
 
 // getNextStream builds stream to transfer this chunk to next chunkserver in the
 // pipeline.
-func getNextStream(chunkId string, addresses []string, chunkSize int) (pb.PipLineService_TransferChunkClient, error) {
+func getNextStream(chunkId string, addresses []string, chunkSize int, checkSums []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
 	Logger.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
-	conn, _ := grpc.Dial(nextAddress+common.AddressDelimiter+viper.GetString(common.ChunkPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, _ := grpc.Dial(util.CombineString(nextAddress, common.AddressDelimiter, viper.GetString(common.ChunkPort)),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
 	newCtx := context.Background()
 	for _, address := range addresses {
@@ -283,6 +287,9 @@ func getNextStream(chunkId string, addresses []string, chunkSize int) (pb.PipLin
 	}
 	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkIdString, chunkId)
 	newCtx = metadata.AppendToOutgoingContext(newCtx, common.ChunkSizeString, strconv.Itoa(chunkSize))
+	for _, checkSum := range checkSums {
+		newCtx = metadata.AppendToOutgoingContext(newCtx, common.CheckSumString, checkSum)
+	}
 	return c.TransferChunk(newCtx)
 }
 
@@ -298,7 +305,7 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 		}
 		close(errChan)
 	}()
-	chunkFile, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
+	chunkFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId, incompleteFileSuffix),
 		os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return
@@ -321,8 +328,8 @@ func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId str
 		}
 	}
 	err = unix.Munmap(chunkData)
-	checkSumFile, err := os.OpenFile(viper.GetString(common.ChecksumStoragePath)+chunkId+checkSumFileSuffix+
-		inCompleteFileSuffix, os.O_RDWR|os.O_CREATE, 0644)
+	checkSumFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId,
+		checkSumFileSuffix, incompleteFileSuffix), os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return
 	}
@@ -349,23 +356,46 @@ func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStrea
 func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
-	file, err := os.Open(fmt.Sprintf("%s%s", viper.GetString(common.ChunkStoragePath), chunkId))
+	checkSums, err := getChecksumFromFile(chunkId)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId), os.O_RDWR, 0644)
 	defer file.Close()
 	if err != nil {
 		return err
 	}
-	for i := 0; i < common.ChunkMBNum; i++ {
-		buffer := make([]byte, common.MB)
-		n, _ := file.Read(buffer)
-		if n == 0 {
-			return nil
+	fInfo, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	pieceNum := int(fInfo.Size() / common.MB)
+	buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
+
+	if err != nil {
+		return err
+	}
+	for i := 0; i < pieceNum-1; i++ {
+		if util.CRC32String(buffer[i*common.MB:(i+1)*common.MB]) != checkSums[i] {
+			MarkInvalidChunk(chunkId)
+			return errors.New("checksum is invalid")
 		}
 		err = stream.Send(&pb.Piece{
-			Piece: buffer[:n],
+			Piece: buffer[i*common.MB : (i+1)*common.MB],
 		})
 		if err != nil {
 			return err
 		}
+	}
+	if util.CRC32String(buffer[(pieceNum-1)*common.MB:]) != checkSums[pieceNum-1] {
+		MarkInvalidChunk(chunkId)
+		return errors.New("checksum is invalid")
+	}
+	err = stream.Send(&pb.Piece{
+		Piece: buffer[(pieceNum-1)*common.MB:],
+	})
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -376,7 +406,7 @@ func getLocalChunksId() []string {
 	defer updateChunksLock.Unlock()
 	var chunksId []string
 	filepath.Walk(viper.GetString(common.ChunkStoragePath), func(path string, info fs.FileInfo, err error) error {
-		if info != nil && !info.IsDir() && !strings.HasSuffix(info.Name(), inCompleteFileSuffix) {
+		if info != nil && !info.IsDir() && !strings.HasSuffix(info.Name(), incompleteFileSuffix) {
 			infos := strings.Split(info.Name(), common.ChunkIdDelimiter)
 			index, _ := strconv.Atoi(infos[1])
 			chunksMap[info.Name()] = &Chunk{
@@ -400,7 +430,7 @@ func getLocalChunksId() []string {
 func ConsumeSendingTasks() {
 	for chunks := range DNInfo.taskChan {
 		var wg sync.WaitGroup
-		infoChan := make(chan *ChunkSendInfo)
+		taskChan := make(chan *ChunkSendTask)
 		resultChan := make(chan *util.ChunkSendResult, len(chunks.Infos))
 		goroutineNum := maxGoroutineNum
 		if len(chunks.Infos) < maxGoroutineNum {
@@ -410,7 +440,7 @@ func ConsumeSendingTasks() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				consumeSingleChunk(infoChan, resultChan)
+				consumeSingleChunk(taskChan, resultChan)
 			}()
 		}
 		for pc, dnId := range chunks.Infos {
@@ -420,18 +450,25 @@ func ConsumeSendingTasks() {
 			for i := 0; i < len(dataNodeIds); i++ {
 				adds = append(adds, chunks.Adds[dataNodeIds[i]])
 			}
-			stat, err := os.Stat(viper.GetString(common.ChunkStoragePath) + chunkId)
+			var stream pb.PipLineService_TransferChunkClient
+			stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
 			// Let consumeSingleChunk handle this error.
 			if err != nil {
 				Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
+				stream = nil
 			}
-			stream, err := getNextStream(chunkId, adds, int(stat.Size()))
+			checkSums, err := getChecksumFromFile(chunkId)
+			if err != nil {
+				Logger.Errorf("Fail to get checksum of the chunk, error detail: %s", err.Error())
+				stream = nil
+			}
+			stream, err = getNextStream(chunkId, adds, int(stat.Size()), checkSums)
 			if err != nil {
 				// Todo
-				stream = nil
 				Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
+				stream = nil
 			}
-			infoChan <- &ChunkSendInfo{
+			taskChan <- &ChunkSendTask{
 				stream:      stream,
 				ChunkId:     chunkId,
 				DataNodeIds: dataNodeIds,
@@ -466,7 +503,7 @@ func ConsumeSendingTasks() {
 	}
 }
 
-type ChunkSendInfo struct {
+type ChunkSendTask struct {
 	stream      pb.PipLineService_TransferChunkClient
 	ChunkId     string   `json:"chunk_id"`
 	DataNodeIds []string `json:"data_node_ids"`
@@ -476,8 +513,8 @@ type ChunkSendInfo struct {
 
 // consumeSingleChunk establishes a pipeline, sends a Chunk to all target chunkserver
 // through the pipeline and return the result by the resultChan.
-func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.ChunkSendResult) {
-	for info := range infoChan {
+func consumeSingleChunk(taskChan chan *ChunkSendTask, resultChan chan *util.ChunkSendResult) {
+	for info := range taskChan {
 		DNInfo.IncIOLoad()
 		defaultSingleResult := &util.ChunkSendResult{
 			ChunkId:          info.ChunkId,
@@ -491,17 +528,28 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 			continue
 		}
 
-		file, err := os.OpenFile(viper.GetString(common.ChunkStoragePath)+info.ChunkId, os.O_RDWR, 0644)
+		file, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), info.ChunkId), os.O_RDWR, 0644)
 		if err != nil {
 			//TODO 出现错误没有处理
 			resultChan <- defaultSingleResult
 			DNInfo.DecIOLoad()
 			continue
 		}
-		fInfo, _ := file.Stat()
+		fInfo, err := file.Stat()
+		if err != nil {
+			resultChan <- defaultSingleResult
+			DNInfo.DecIOLoad()
+			file.Close()
+			continue
+		}
 		pieceNum := int(fInfo.Size() / common.MB)
-		buffer, _ := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
-
+		buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
+		if err != nil {
+			resultChan <- defaultSingleResult
+			DNInfo.DecIOLoad()
+			file.Close()
+			continue
+		}
 		for i := 0; i < pieceNum; i++ {
 			if i == pieceNum-1 {
 				err = info.stream.Send(&pb.PieceOfChunk{
@@ -535,4 +583,21 @@ func consumeSingleChunk(infoChan chan *ChunkSendInfo, resultChan chan *util.Chun
 		}
 		_ = unix.Munmap(buffer)
 	}
+}
+
+func getChecksumFromFile(chunkId string) ([]string, error) {
+	checksum := make([]string, 0, common.ChunkMBNum)
+	file, err := os.Open(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
+	if err != nil {
+		return nil, err
+	}
+	buffer := make([]byte, 256)
+	n, err := file.Read(buffer)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < n/4; i++ {
+		checksum[i] = util.Bytes2String(buffer[i*4 : (i+1)*4])
+	}
+	return checksum, nil
 }

@@ -79,7 +79,7 @@ func (handler *ChunkServerHandler) Server() {
 	go Heartbeat()
 	ip, _ := util.GetLocalIP()
 	Logger.Infof("local ip is: %s", ip)
-	listener, err := net.Listen(common.TCP, common.AddressDelimiter+viper.GetString(common.ChunkPort))
+	listener, err := net.Listen(common.TCP, util.CombineString(common.AddressDelimiter, viper.GetString(common.ChunkPort)))
 	Logger.Infof("Listen address: %s", listener.Addr().String())
 	if err != nil {
 		Logger.Errorf("Fail to server, error code: %v, error detail: %s,", common.ChunkServerRPCServerFailed, err.Error())
