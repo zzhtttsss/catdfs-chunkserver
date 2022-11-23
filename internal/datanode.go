@@ -20,8 +20,8 @@ type DataNodeInfo struct {
 	Conn *grpc.ClientConn
 	// ioLoad represent IO load of a chunkserver.
 	ioLoad atomic.Int64
-	// taskChan is used to cache all incoming SendingTask.
-	taskChan chan *SendingTask
+	// BatchChunkTaskChan is used to cache all incoming BatchChunkTask.
+	BatchChunkTaskChan chan *BatchChunkTask
 	//futureChunkNum means the number of pending chunks in expansion operation
 	futureChunkNum int
 	// IsReady represents this datanode is ready to serve with master.
@@ -29,11 +29,11 @@ type DataNodeInfo struct {
 }
 
 var (
-	// failSendResult contains all fail results of SendingTask that have been completed
+	// failSendResult contains all fail results of BatchChunkTask that have been completed
 	// but not notified to the master.
 	// key: Chunk' id and sendType; value: slice of DataNode' id
 	failSendResult = make(map[PendingChunk][]string)
-	// successSendResult contains all success results of SendingTask that have been
+	// successSendResult contains all success results of BatchChunkTask that have been
 	// completed but not notified to the master.
 	// key: Chunk' id and sendType; value: slice of DataNode' id
 	successSendResult = make(map[PendingChunk][]string)
@@ -45,8 +45,8 @@ type PendingChunk struct {
 	sendType int
 }
 
-// SendingTask represent all Chunk sending jobs given by the master in one heartbeat.
-type SendingTask struct {
+// BatchChunkTask represent all Chunk sending tasks given by the master in one heartbeat.
+type BatchChunkTask struct {
 	// Infos key: Chunk' id; value: slice of DataNode' id
 	Infos map[PendingChunk][]string `json:"infos"`
 	// Adds key: DataNode' id; value: DataNode' address
@@ -65,8 +65,8 @@ func (d *DataNodeInfo) GetIOLoad() int64 {
 	return d.ioLoad.Load()
 }
 
-func (d *DataNodeInfo) Add2chan(chunks *SendingTask) {
-	d.taskChan <- chunks
+func (d *DataNodeInfo) Add2chan(chunks *BatchChunkTask) {
+	d.BatchChunkTaskChan <- chunks
 }
 
 func Merge2SendResult(newFailSendResult map[PendingChunk][]string, newSuccessSendResult map[PendingChunk][]string) {

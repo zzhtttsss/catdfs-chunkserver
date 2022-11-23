@@ -54,12 +54,12 @@ func RegisterDataNode() *DataNodeInfo {
 	var ioLoad atomic.Int64
 	ioLoad.Store(0)
 	return &DataNodeInfo{
-		Id:             res.Id,
-		Conn:           conn,
-		ioLoad:         ioLoad,
-		taskChan:       make(chan *SendingTask),
-		futureChunkNum: int(res.PendingCount),
-		IsReady:        res.PendingCount == uint32(len(localChunksId)),
+		Id:                 res.Id,
+		Conn:               conn,
+		ioLoad:             ioLoad,
+		BatchChunkTaskChan: make(chan *BatchChunkTask),
+		futureChunkNum:     int(res.PendingCount),
+		IsReady:            res.PendingCount == uint32(len(localChunksId)),
 	}
 }
 
@@ -86,7 +86,7 @@ func getMasterConn() (*grpc.ClientConn, error) {
 // Heartbeat run in a goroutine. It keeps looping to do heartbeat with master
 // every several seconds. It sends the result of transferring Chunk and receive
 // the information which Chunk need to be transferred next and put the information
-// into the taskChan.
+// into the BatchChunkTaskChan.
 func Heartbeat() {
 	for {
 		errCount := 0
@@ -118,158 +118,228 @@ func Heartbeat() {
 			DNInfo.Conn = conn
 			errCount++
 		}
-		errCount = 0
-		if heartbeatReply.ChunkInfos != nil {
-			Logger.Debugf("Some chunks need to be proceed.")
-			// Store the destination of pending chunk
-			infosMap := make(map[PendingChunk][]string)
-			// Store the address of datanode
-			addsMap := make(map[string]string)
-			removedChunks := make([]string, 0)
-			updateMapLock.Lock()
-			for i, info := range heartbeatReply.ChunkInfos {
-				Logger.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
-				pc := PendingChunk{
-					chunkId:  info.ChunkId,
-					sendType: int(info.SendType),
-				}
-				if info.SendType == common.DeleteSendType {
-					if dataNodeIds, ok := successSendResult[pc]; ok {
-						dataNodeIds = append(dataNodeIds, dataNodeIds...)
-					} else {
-						successSendResult[pc] = dataNodeIds
-					}
-					removedChunks = append(removedChunks, info.ChunkId)
-					continue
-				}
-				dataNodeIds, ok := infosMap[pc]
-				addsMap[info.DataNodeId] = heartbeatReply.DataNodeAddress[i]
-				if ok {
-					dataNodeIds = append(dataNodeIds, info.DataNodeId)
-				} else {
-					infosMap[pc] = []string{info.DataNodeId}
-				}
-			}
-			updateMapLock.Unlock()
-			DNInfo.Add2chan(&SendingTask{
-				Infos: infosMap,
-				Adds:  addsMap,
-			})
-			BatchRemoveChunkById(removedChunks)
-		}
+		handleHeartbeatReply(heartbeatReply)
 		if errCount >= heartbeatRetryTime {
 			Logger.Fatalf("[Id=%s] disconnected", DNInfo.Id)
 			break
 		}
+		errCount = 0
 		time.Sleep(time.Second * time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)))
 	}
 
 }
 
-func DoTransferFile(stream pb.PipLineService_TransferChunkServer) error {
+func handleHeartbeatReply(reply *pb.HeartbeatReply) {
+	if reply.ChunkInfos != nil {
+		Logger.Debugf("Some chunks need to be proceed.")
+		var (
+			// Store the destination of pending chunk
+			infosMap = make(map[PendingChunk][]string)
+			// Store the address of datanode
+			addsMap       = make(map[string]string)
+			removedChunks = make([]string, 0)
+		)
+
+		updateMapLock.Lock()
+		for i, info := range reply.ChunkInfos {
+			Logger.Debugf("ChunkId %s with SendType %v", info.ChunkId, info.SendType)
+			pc := PendingChunk{
+				chunkId:  info.ChunkId,
+				sendType: int(info.SendType),
+			}
+			if info.SendType == common.DeleteSendType {
+				if dataNodeIds, ok := successSendResult[pc]; ok {
+					dataNodeIds = append(dataNodeIds, dataNodeIds...)
+				} else {
+					successSendResult[pc] = dataNodeIds
+				}
+				removedChunks = append(removedChunks, info.ChunkId)
+				continue
+			}
+			dataNodeIds, ok := infosMap[pc]
+			addsMap[info.DataNodeId] = reply.DataNodeAddress[i]
+			if ok {
+				dataNodeIds = append(dataNodeIds, info.DataNodeId)
+			} else {
+				infosMap[pc] = []string{info.DataNodeId}
+			}
+		}
+		updateMapLock.Unlock()
+		DNInfo.Add2chan(&BatchChunkTask{
+			Infos: infosMap,
+			Adds:  addsMap,
+		})
+		BatchRemoveChunkById(removedChunks)
+	}
+}
+
+type ChunkTransferInfo struct {
+	chunkId    string
+	addresses  []string
+	chunkSize  int
+	checkSums  []string
+	failAdds   []string
+	pieceChan  chan *pb.PieceOfChunk
+	errChan    chan error
+	stream     pb.PipLineService_TransferChunkServer
+	nextStream pb.PipLineService_TransferChunkClient
+}
+
+func DoTransferChunk(stream pb.PipLineService_TransferChunkServer) error {
 	var (
-		pieceOfChunk   *pb.PieceOfChunk
-		nextStream     pb.PipLineService_TransferChunkClient
 		wg             sync.WaitGroup
-		err            error
-		isStoreSuccess bool
+		isStoreSuccess = true
 	)
-	failAdds := make([]string, 0)
-	// Get chunkId and slice including all chunkserver address that need to store this chunk.
-	md, _ := metadata.FromIncomingContext(stream.Context())
-	chunkId := md.Get(common.ChunkIdString)[0]
-	addresses := md.Get(common.AddressString)
-	chunkSize, _ := strconv.Atoi(md.Get(common.ChunkSizeString)[0])
-	checkSums := md.Get(common.CheckSumString)
-	checkSumString := strings.Join(checkSums, "")
-	AddPendingChunk(chunkId)
+
+	info, err := getChunkTransferInfo(stream)
+	if err != nil {
+		return err
+	}
+	AddPendingChunk(info.chunkId)
 	defer func() {
-		Logger.Debugf("Chunk: %s, failAdds: %v", chunkId, failAdds)
-		currentReply := &pb.TransferChunkReply{
-			ChunkId:  chunkId,
-			FailAdds: failAdds,
-		}
-		err = stream.SendAndClose(currentReply)
-		// If current chunkserver can not send the result to previous chunkserver, we can not get
-		// how many chunkserver have failed, so we treat this situation as a failure.
-		if err != nil {
-			Logger.Errorf("Fail to close receive stream, error detail: %s", err.Error())
-			isStoreSuccess = false
-		}
-		if isStoreSuccess {
-			FinishChunk(chunkId)
-		}
+		handleTransferResult(info, isStoreSuccess)
 	}()
-	if len(addresses) > 1 {
-		// Todo: try each address until success
-		nextStream, err = getNextStream(chunkId, addresses[1:], chunkSize, checkSums)
-		if err != nil {
-			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
-			// It doesn't matter if we can't get the next stream, just handle current chunkserver as the last one.
-			failAdds = append(failAdds, addresses[1:]...)
-			nextStream = nil
-		}
+	if len(info.addresses) > 1 {
+		setNextStream(info)
 	}
 	// Every piece of chunk will be added into pieceChan so that storeChunk function
 	// can get all pieces sequentially. If storeChunk occurs error and return, there
 	// will be no consumer to consume pieceChan, so we need make pieceChan has cache.
-	pieceChan := make(chan *pb.PieceOfChunk, common.ChunkMBNum)
-	errChan := make(chan error, 1)
+	info.pieceChan = make(chan *pb.PieceOfChunk, common.ChunkMBNum)
+	info.errChan = make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		storeChunk(pieceChan, errChan, chunkId, chunkSize, checkSumString)
+		storeChunk(info)
 	}()
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
+
 	// Receive pieces of chunk until there are no more pieces.
+	err = consumePiece(info)
+	if err != nil {
+		_ = finishConsume(info, &wg, false)
+		isStoreSuccess = false
+		return err
+	}
+	err = finishConsume(info, &wg, true)
+	if err != nil {
+		isStoreSuccess = false
+		return err
+	}
+	return nil
+}
+
+func getChunkTransferInfo(stream pb.PipLineService_TransferChunkServer) (*ChunkTransferInfo, error) {
+	failAdds := make([]string, 0)
+	// Get chunkId and slice including all chunkserver address that need to store this chunk.
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if !ok {
+		return nil, errors.New("fail to get metadata from context")
+	}
+	chunkId := md.Get(common.ChunkIdString)[0]
+	addresses := md.Get(common.AddressString)
+	chunkSize, _ := strconv.Atoi(md.Get(common.ChunkSizeString)[0])
+	checkSums := md.Get(common.CheckSumString)
+
+	return &ChunkTransferInfo{
+		chunkId:    chunkId,
+		addresses:  addresses,
+		chunkSize:  chunkSize,
+		checkSums:  checkSums,
+		failAdds:   failAdds,
+		stream:     stream,
+		nextStream: nil,
+	}, nil
+}
+
+func handleTransferResult(info *ChunkTransferInfo, isStoreSuccess bool) {
+	Logger.Debugf("Chunk: %s, failAdds: %v", info.chunkId, info.failAdds)
+	currentReply := &pb.TransferChunkReply{
+		ChunkId:  info.chunkId,
+		FailAdds: info.failAdds,
+	}
+	err := info.stream.SendAndClose(currentReply)
+	// If current chunkserver can not send the result to previous chunkserver, we can
+	// not get how many chunkserver have failed, so we treat this situation as a failure.
+	if err != nil {
+		Logger.Errorf("Fail to close receive stream, error detail: %s", err.Error())
+		isStoreSuccess = false
+	}
+	if isStoreSuccess {
+		FinishChunk(info.chunkId)
+	}
+}
+
+func consumePiece(info *ChunkTransferInfo) error {
 	pieceIndex := 0
 	for {
-		pieceOfChunk, err = stream.Recv()
-		if err == io.EOF {
-			close(pieceChan)
-			if nextStream != nil {
-				previousReply, err := nextStream.CloseAndRecv()
-				if err != nil {
-					Logger.Errorf("Fail to close send stream, error detail: %s", err.Error())
-					failAdds = append(failAdds, addresses[1:]...)
-				} else {
-					failAdds = append(failAdds, previousReply.FailAdds...)
-				}
-			}
-			// Main thread will wait until goroutine success to store the block.
-			wg.Wait()
-			if len(errChan) != 0 {
-				err = <-errChan
-				Logger.Errorf("Fail to store a chunk, error detail: %s", err.Error())
-				isStoreSuccess = false
-				failAdds = append(failAdds, addresses[0])
-				return err
-			}
-			isStoreSuccess = true
-			Logger.Infof("Success to store a chunk, id: %s", chunkId)
+		pieceOfChunk, err := info.stream.Recv()
+		if err == io.EOF && pieceIndex == len(info.checkSums) {
 			return nil
+		} else if err == io.EOF {
+			err = errors.New("stream is closed by sender before transferring is complete")
+			Logger.Errorf("Fail to receive a piece from previous chunkserver or client, error detail: %s", err.Error())
+			return err
 		} else if err != nil {
 			Logger.Errorf("Fail to receive a piece from previous chunkserver or client, error detail: %s", err.Error())
-			close(pieceChan)
-			isStoreSuccess = false
 			return err
-		} else if util.CRC32String(pieceOfChunk.Piece) != checkSums[pieceIndex] {
+		} else if util.CRC32String(pieceOfChunk.Piece) != info.checkSums[pieceIndex] {
 			err = fmt.Errorf("checksum is invalid")
 			Logger.Errorf("Fail to receive a piece from previous chunkserver or client, error detail: %s", err.Error())
-			close(pieceChan)
-			isStoreSuccess = false
 			return err
 		}
-		pieceChan <- pieceOfChunk
-		if nextStream != nil {
-			err := nextStream.Send(pieceOfChunk)
+		info.pieceChan <- pieceOfChunk
+		if info.nextStream != nil {
+			err := info.nextStream.Send(pieceOfChunk)
 			if err != nil {
 				Logger.Errorf("Fail to send a piece to next chunkserver, error detail: %s", err.Error())
-				failAdds = append(failAdds, addresses[1:]...)
-				nextStream = nil
+				info.failAdds = append(info.failAdds, info.addresses[1:]...)
+				info.nextStream = nil
 			}
 		}
+		pieceIndex++
+	}
+}
+
+func finishConsume(info *ChunkTransferInfo, wg *sync.WaitGroup, isSuccess bool) error {
+	close(info.pieceChan)
+	if info.nextStream != nil {
+		previousReply, err := info.nextStream.CloseAndRecv()
+		if !isSuccess {
+			info.failAdds = append(info.failAdds, info.addresses...)
+			return err
+		}
+		if err != nil {
+			Logger.Errorf("Fail to close send stream, error detail: %s", err.Error())
+			info.failAdds = append(info.failAdds, info.addresses[1:]...)
+		} else {
+			info.failAdds = append(info.failAdds, previousReply.FailAdds...)
+		}
+	}
+	// Main thread will wait until goroutine success to store the block.
+	wg.Wait()
+	if len(info.errChan) != 0 {
+		err := <-info.errChan
+		Logger.Errorf("Fail to store a chunk, error detail: %s", err.Error())
+		info.failAdds = append(info.failAdds, info.addresses[0])
+		return err
+	}
+	Logger.Infof("Success to store a chunk, id: %s", info.chunkId)
+	return nil
+}
+
+// setNextStream builds stream to transfer this chunk to next chunkserver in the
+// pipeline.
+func setNextStream(info *ChunkTransferInfo) {
+	var err error
+	info.nextStream, err = getNextStream(info.chunkId, info.addresses, info.chunkSize, info.checkSums)
+	if err != nil {
+		Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
+		// It doesn't matter if we can't get the next stream, just handle current
+		// chunkserver as the last one.
+		info.failAdds = append(info.failAdds, info.addresses[1:]...)
+		info.nextStream = nil
 	}
 }
 
@@ -296,39 +366,41 @@ func getNextStream(chunkId string, addresses []string, chunkSize int, checkSums 
 // StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
 // operation is very slow, this function will be run in a goroutine to not block
 // the main thread transferring the chunk to another chunkserver.
-func storeChunk(pieceChan chan *pb.PieceOfChunk, errChan chan error, chunkId string, chunkSize int, checkSumString string) {
+func storeChunk(info *ChunkTransferInfo) {
 	var err error
+	checkSumString := strings.Join(info.checkSums, "")
 	defer func() {
 		if err != nil {
-			Logger.Errorf("Fail to store a chunk, chunkId = %s, error detail: %s", chunkId, err.Error())
-			errChan <- err
+			Logger.Errorf("Fail to store a chunk, chunkId = %s, error detail: %s", info.chunkId, err.Error())
+			info.errChan <- err
 		}
-		close(errChan)
+		close(info.errChan)
 	}()
-	chunkFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId, incompleteFileSuffix),
+	chunkFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), info.chunkId, incompleteFileSuffix),
 		os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return
 	}
 	defer chunkFile.Close()
-	err = chunkFile.Truncate(int64(chunkSize))
+	err = chunkFile.Truncate(int64(info.chunkSize))
 	if err != nil {
 		return
 	}
-	chunkData, err := unix.Mmap(int(chunkFile.Fd()), 0, chunkSize, syscall.PROT_WRITE, syscall.MAP_SHARED)
+	chunkData, err := unix.Mmap(int(chunkFile.Fd()), 0, info.chunkSize, syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return
 	}
 	// Goroutine will be blocked until main thread receive pieces of chunk and put them into pieceChan.
 	index := 0
-	for piece := range pieceChan {
+	for piece := range info.pieceChan {
 		for _, b := range piece.Piece {
 			chunkData[index] = b
 			index++
 		}
 	}
 	err = unix.Munmap(chunkData)
-	checkSumFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId,
+	// Store checksum of the chunk to disk.
+	checkSumFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChecksumStoragePath), info.chunkId,
 		checkSumFileSuffix, incompleteFileSuffix), os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return
@@ -400,6 +472,23 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 	return nil
 }
 
+func getChecksumFromFile(chunkId string) ([]string, error) {
+	checksum := make([]string, 0, common.ChunkMBNum)
+	file, err := os.Open(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
+	if err != nil {
+		return nil, err
+	}
+	buffer := make([]byte, 256)
+	n, err := file.Read(buffer)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < n/4; i++ {
+		checksum[i] = util.Bytes2String(buffer[i*4 : (i+1)*4])
+	}
+	return checksum, nil
+}
+
 // getLocalChunksId walks through the chunk directory and get all chunks names.
 func getLocalChunksId() []string {
 	updateChunksLock.Lock()
@@ -424,86 +513,113 @@ func getLocalChunksId() []string {
 	return chunksId
 }
 
-// ConsumeSendingTasks runs in a goroutine. It gets and consumes SendingTask from
-// taskChan. In particular, it will send all Chunk to the target chunkservers in
-// the SendingTask and merge the result of SendingTask into existing results.
-func ConsumeSendingTasks() {
-	for chunks := range DNInfo.taskChan {
-		var wg sync.WaitGroup
-		taskChan := make(chan *ChunkSendTask)
-		resultChan := make(chan *util.ChunkSendResult, len(chunks.Infos))
-		goroutineNum := maxGoroutineNum
-		if len(chunks.Infos) < maxGoroutineNum {
-			goroutineNum = len(chunks.Infos)
-		}
-		for i := 0; i < goroutineNum; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				consumeSingleChunk(taskChan, resultChan)
-			}()
-		}
-		for pc, dnId := range chunks.Infos {
-			chunkId := pc.chunkId
-			dataNodeIds := dnId
-			adds := make([]string, 0, len(dataNodeIds))
-			for i := 0; i < len(dataNodeIds); i++ {
-				adds = append(adds, chunks.Adds[dataNodeIds[i]])
-			}
-			var stream pb.PipLineService_TransferChunkClient
-			stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
-			// Let consumeSingleChunk handle this error.
-			if err != nil {
-				Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
-				stream = nil
-			}
-			checkSums, err := getChecksumFromFile(chunkId)
-			if err != nil {
-				Logger.Errorf("Fail to get checksum of the chunk, error detail: %s", err.Error())
-				stream = nil
-			}
-			stream, err = getNextStream(chunkId, adds, int(stat.Size()), checkSums)
-			if err != nil {
-				// Todo
-				Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
-				stream = nil
-			}
-			taskChan <- &ChunkSendTask{
-				stream:      stream,
-				ChunkId:     chunkId,
-				DataNodeIds: dataNodeIds,
-				Adds:        adds,
-				SendType:    pc.sendType,
-			}
-		}
-		wg.Wait()
-		close(resultChan)
-		var (
-			newFailSendResult    = make(map[PendingChunk][]string)
-			newSuccessSendResult = make(map[PendingChunk][]string)
-			removedChunkIds      = make([]string, 0)
-		)
-		for result := range resultChan {
-			newSuccessSendResult[PendingChunk{
-				chunkId:  result.ChunkId,
-				sendType: result.SendType,
-			}] = result.SuccessDataNodes
-			if result.SendType == common.CopySendType {
-				newFailSendResult[PendingChunk{
-					chunkId:  result.ChunkId,
-					sendType: result.SendType,
-				}] = result.FailDataNodes
-			} else if result.SendType == common.MoveSendType {
-				Logger.Debugf("Delete Chunk: %s", result.ChunkId)
-				removedChunkIds = append(removedChunkIds, result.ChunkId)
-			}
-		}
+type BatchChunkTaskInfo struct {
+	task          *BatchChunkTask
+	wg            *sync.WaitGroup
+	chunkTaskChan chan *ChunkTask
+	resultChan    chan *util.ChunkTaskResult
+}
+
+// ConsumeBatchChunkTasks runs in a goroutine. It gets and consumes BatchChunkTask from
+// BatchChunkTaskChan. In particular, it will send all Chunk to the target chunkservers in
+// the BatchChunkTask and merge the result of BatchChunkTask into existing results.
+func ConsumeBatchChunkTasks() {
+	for batchChunkTask := range DNInfo.BatchChunkTaskChan {
+		info := startConsumeBatchTask(batchChunkTask)
+		sendTasks2Consumer(info)
+		info.wg.Wait()
+		close(info.resultChan)
+		newSuccessSendResult, newFailSendResult, removedChunkIds := handleConsumeResult(info.resultChan)
 		Merge2SendResult(newFailSendResult, newSuccessSendResult)
 		BatchRemoveChunkById(removedChunkIds)
 	}
 }
 
-type ChunkSendTask struct {
+func startConsumeBatchTask(batchChunkTask *BatchChunkTask) *BatchChunkTaskInfo {
+	var wg sync.WaitGroup
+	info := &BatchChunkTaskInfo{
+		task:          batchChunkTask,
+		wg:            &wg,
+		chunkTaskChan: make(chan *ChunkTask),
+		resultChan:    make(chan *util.ChunkTaskResult, len(batchChunkTask.Infos)),
+	}
+	taskNum := len(info.task.Infos)
+	goroutineNum := maxGoroutineNum
+	if taskNum < maxGoroutineNum {
+		goroutineNum = taskNum
+	}
+	for i := 0; i < goroutineNum; i++ {
+		info.wg.Add(1)
+		go func() {
+			defer info.wg.Done()
+			consumeSingleTask(info.chunkTaskChan, info.resultChan)
+		}()
+	}
+	return info
+}
+
+func sendTasks2Consumer(info *BatchChunkTaskInfo) {
+	for pc, dnId := range info.task.Infos {
+		chunkId := pc.chunkId
+		dataNodeIds := dnId
+		adds := make([]string, 0, len(dataNodeIds))
+		for i := 0; i < len(dataNodeIds); i++ {
+			adds = append(adds, info.task.Adds[dataNodeIds[i]])
+		}
+		var stream pb.PipLineService_TransferChunkClient
+		stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
+		// Let consumeSingleTask handle this error.
+		if err != nil {
+			Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
+			stream = nil
+		}
+		checkSums, err := getChecksumFromFile(chunkId)
+		if err != nil {
+			Logger.Errorf("Fail to get checksum of the chunk, error detail: %s", err.Error())
+			stream = nil
+		}
+		stream, err = getNextStream(chunkId, adds, int(stat.Size()), checkSums)
+		if err != nil {
+			// Todo
+			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
+			stream = nil
+		}
+		info.chunkTaskChan <- &ChunkTask{
+			stream:      stream,
+			ChunkId:     chunkId,
+			DataNodeIds: dataNodeIds,
+			Adds:        adds,
+			SendType:    pc.sendType,
+		}
+	}
+}
+
+func handleConsumeResult(resultChan chan *util.ChunkTaskResult) (map[PendingChunk][]string, map[PendingChunk][]string,
+	[]string) {
+	var (
+		newFailSendResult    = make(map[PendingChunk][]string)
+		newSuccessSendResult = make(map[PendingChunk][]string)
+		removedChunkIds      = make([]string, 0)
+	)
+	for result := range resultChan {
+		newSuccessSendResult[PendingChunk{
+			chunkId:  result.ChunkId,
+			sendType: result.SendType,
+		}] = result.SuccessDataNodes
+		if result.SendType == common.CopySendType {
+			newFailSendResult[PendingChunk{
+				chunkId:  result.ChunkId,
+				sendType: result.SendType,
+			}] = result.FailDataNodes
+		} else if result.SendType == common.MoveSendType {
+			Logger.Debugf("Delete Chunk: %s", result.ChunkId)
+			removedChunkIds = append(removedChunkIds, result.ChunkId)
+		}
+	}
+	return newSuccessSendResult, newFailSendResult, removedChunkIds
+}
+
+type ChunkTask struct {
 	stream      pb.PipLineService_TransferChunkClient
 	ChunkId     string   `json:"chunk_id"`
 	DataNodeIds []string `json:"data_node_ids"`
@@ -511,93 +627,84 @@ type ChunkSendTask struct {
 	SendType    int      `json:"send_type"`
 }
 
-// consumeSingleChunk establishes a pipeline, sends a Chunk to all target chunkserver
+// consumeSingleTask establishes a pipeline, sends a Chunk to all target chunkserver
 // through the pipeline and return the result by the resultChan.
-func consumeSingleChunk(taskChan chan *ChunkSendTask, resultChan chan *util.ChunkSendResult) {
-	for info := range taskChan {
-		DNInfo.IncIOLoad()
-		defaultSingleResult := &util.ChunkSendResult{
-			ChunkId:          info.ChunkId,
-			FailDataNodes:    info.DataNodeIds,
-			SuccessDataNodes: info.DataNodeIds[0:0],
-			SendType:         info.SendType,
-		}
-		if info.stream == nil {
-			resultChan <- defaultSingleResult
-			DNInfo.DecIOLoad()
-			continue
-		}
-
-		file, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), info.ChunkId), os.O_RDWR, 0644)
-		if err != nil {
-			//TODO 出现错误没有处理
-			resultChan <- defaultSingleResult
-			DNInfo.DecIOLoad()
-			continue
-		}
-		fInfo, err := file.Stat()
-		if err != nil {
-			resultChan <- defaultSingleResult
-			DNInfo.DecIOLoad()
-			file.Close()
-			continue
-		}
-		pieceNum := int(fInfo.Size() / common.MB)
-		buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
-		if err != nil {
-			resultChan <- defaultSingleResult
-			DNInfo.DecIOLoad()
-			file.Close()
-			continue
-		}
-		for i := 0; i < pieceNum; i++ {
-			if i == pieceNum-1 {
-				err = info.stream.Send(&pb.PieceOfChunk{
-					Piece: buffer[i*common.MB : fInfo.Size()],
-				})
-			} else {
-				err = info.stream.Send(&pb.PieceOfChunk{
-					Piece: buffer[i*common.MB : (i+1)*common.MB],
-				})
-			}
-
-			if err != nil {
-				resultChan <- defaultSingleResult
-				DNInfo.DecIOLoad()
-				file.Close()
-				break
-			}
-			// sending done
-			if i == pieceNum-1 {
-				transferChunkReply, err := info.stream.CloseAndRecv()
-				if err != nil {
-					DNInfo.DecIOLoad()
-					resultChan <- defaultSingleResult
-					file.Close()
-					break
-				}
-				resultChan <- util.ConvReply2SingleResult(transferChunkReply, info.DataNodeIds, info.Adds, info.SendType)
-				DNInfo.DecIOLoad()
-				file.Close()
-			}
-		}
-		_ = unix.Munmap(buffer)
+func consumeSingleTask(taskChan chan *ChunkTask, resultChan chan *util.ChunkTaskResult) {
+	for task := range taskChan {
+		currentTaskResult, _ := doConsumeSingleTask(task)
+		resultChan <- currentTaskResult
 	}
 }
 
-func getChecksumFromFile(chunkId string) ([]string, error) {
-	checksum := make([]string, 0, common.ChunkMBNum)
-	file, err := os.Open(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
+func doConsumeSingleTask(task *ChunkTask) (*util.ChunkTaskResult, error) {
+	currentTaskResult := &util.ChunkTaskResult{
+		ChunkId:          task.ChunkId,
+		FailDataNodes:    task.DataNodeIds,
+		SuccessDataNodes: task.DataNodeIds[0:0],
+		SendType:         task.SendType,
+	}
+	DNInfo.IncIOLoad()
+	defer DNInfo.DecIOLoad()
+	if task.stream == nil {
+		return currentTaskResult, errors.New("stream is nil")
+	}
+	err := sendChunk2Cs(task.ChunkId, task.stream)
 	if err != nil {
-		return nil, err
+		Logger.Errorf("Fail to send chunk, error detail: %s", err.Error())
+		_, _ = task.stream.CloseAndRecv()
+		return currentTaskResult, err
 	}
-	buffer := make([]byte, 256)
-	n, err := file.Read(buffer)
+	reply, err := task.stream.CloseAndRecv()
 	if err != nil {
-		return nil, err
+		Logger.Errorf("Fail to close stream, error detail: %s", err.Error())
+		return currentTaskResult, err
 	}
-	for i := 0; i < n/4; i++ {
-		checksum[i] = util.Bytes2String(buffer[i*4 : (i+1)*4])
+	currentTaskResult = util.ConvReply2SingleResult(reply, task.DataNodeIds, task.Adds, task.SendType)
+	return currentTaskResult, nil
+}
+
+func sendChunk2Cs(chunkId string, stream pb.PipLineService_TransferChunkClient) error {
+	var err error
+	checkSums, err := getChecksumFromFile(chunkId)
+	if err != nil {
+		return err
 	}
-	return checksum, nil
+	file, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId), os.O_RDWR, 0644)
+	defer file.Close()
+	if err != nil {
+		return err
+	}
+	fInfo, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	pieceNum := int(fInfo.Size() / common.MB)
+	buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
+
+	if err != nil {
+		return err
+	}
+	for i := 0; i < pieceNum-1; i++ {
+		if util.CRC32String(buffer[i*common.MB:(i+1)*common.MB]) != checkSums[i] {
+			MarkInvalidChunk(chunkId)
+			return errors.New("checksum is invalid")
+		}
+		err = stream.Send(&pb.PieceOfChunk{
+			Piece: buffer[i*common.MB : (i+1)*common.MB],
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if util.CRC32String(buffer[(pieceNum-1)*common.MB:]) != checkSums[pieceNum-1] {
+		MarkInvalidChunk(chunkId)
+		return errors.New("checksum is invalid")
+	}
+	err = stream.Send(&pb.PieceOfChunk{
+		Piece: buffer[(pieceNum-1)*common.MB:],
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }

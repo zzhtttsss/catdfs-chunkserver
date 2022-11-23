@@ -49,7 +49,7 @@ func (handler *ChunkServerHandler) TransferChunk(stream pb.PipLineService_Transf
 	p, _ := peer.FromContext(stream.Context())
 	address := p.Addr.String()
 	Logger.Infof("Start to receive snd send chunk from: %s", address)
-	err := DoTransferFile(stream)
+	err := DoTransferChunk(stream)
 	if err != nil {
 		Logger.Errorf("Fail to receive snd send chunk from: %s", address)
 		details, _ := status.New(codes.Internal, err.Error()).WithDetails(&pb.RPCError{
