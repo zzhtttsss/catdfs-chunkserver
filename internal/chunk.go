@@ -46,7 +46,7 @@ func AddPendingChunk(chunkId string) {
 
 func FinishChunk(chunkId string) {
 	_ = makeFileComplete(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
-	_ = makeFileComplete(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId, checkSumFileSuffix))
+	_ = makeFileComplete(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
 	updateChunksLock.Lock()
 	defer updateChunksLock.Unlock()
 	chunksMap[chunkId].IsComplete = true
@@ -111,7 +111,7 @@ func EraseChunk(chunkId string) {
 	defer updateChunksLock.Unlock()
 	delete(chunksMap, chunkId)
 	_ = os.Remove(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
-	_ = os.Remove(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId, checkSumFileSuffix))
+	_ = os.Remove(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
 }
 
 func MarkInvalidChunk(chunkId string) {
@@ -120,9 +120,9 @@ func MarkInvalidChunk(chunkId string) {
 }
 
 func HandleInvalidChunks() []string {
-	len := invalidChunkSet.Cardinality()
-	chunkIds := make([]string, len)
-	for i := 0; i < len; i++ {
+	num := invalidChunkSet.Cardinality()
+	chunkIds := make([]string, num)
+	for i := 0; i < num; i++ {
 		chunkIds[i] = invalidChunkSet.Pop().(string)
 	}
 	return chunkIds

@@ -30,7 +30,7 @@ const (
 	maxGoroutineNum      = 5
 	incompleteFileSuffix = "_incomplete"
 	checkSumFileSuffix   = ".crc"
-	maxCheckSumSize      = 256
+	checksumDelimiter    = " "
 )
 
 // RegisterDataNode register this chunkserver to the master.
@@ -333,7 +333,7 @@ func finishConsume(info *ChunkTransferInfo, wg *sync.WaitGroup, isSuccess bool) 
 // pipeline.
 func setNextStream(info *ChunkTransferInfo) {
 	var err error
-	info.nextStream, err = getNextStream(info.chunkId, info.addresses, info.chunkSize, info.checkSums)
+	info.nextStream, err = getNextStream(info.chunkId, info.addresses[1:], info.chunkSize, info.checkSums)
 	if err != nil {
 		Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 		// It doesn't matter if we can't get the next stream, just handle current
@@ -347,7 +347,7 @@ func setNextStream(info *ChunkTransferInfo) {
 // pipeline.
 func getNextStream(chunkId string, addresses []string, chunkSize int, checkSums []string) (pb.PipLineService_TransferChunkClient, error) {
 	nextAddress := addresses[0]
-	Logger.Infof("Get stream, chunk id: %s, next address: %s", chunkId, nextAddress)
+	Logger.Infof("Get next stream, chunk id: %s, next address: %s", chunkId, nextAddress)
 	conn, _ := grpc.Dial(util.CombineString(nextAddress, common.AddressDelimiter, viper.GetString(common.ChunkPort)),
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	c := pb.NewPipLineServiceClient(conn)
@@ -368,7 +368,7 @@ func getNextStream(chunkId string, addresses []string, chunkSize int, checkSums 
 // the main thread transferring the chunk to another chunkserver.
 func storeChunk(info *ChunkTransferInfo) {
 	var err error
-	checkSumString := strings.Join(info.checkSums, "")
+	checkSumString := strings.Join(info.checkSums, checksumDelimiter)
 	defer func() {
 		if err != nil {
 			Logger.Errorf("Fail to store a chunk, chunkId = %s, error detail: %s", info.chunkId, err.Error())
@@ -415,20 +415,21 @@ func storeChunk(info *ChunkTransferInfo) {
 // DoSendStream2Client calls rpc to send data to client.
 func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
 	//TODO 检查资源完整性
-	//wait to return until sendChunk is finished or err occurs
-	err := sendChunk(stream, args.ChunkId)
+	//wait to return until sendChunk2Client is finished or err occurs
+	err := sendChunk2Client(stream, args.ChunkId)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-// sendChunk establishes a pipeline and sends a Chunk to next chunkserver in the
+// sendChunk2Client establishes a pipeline and sends a Chunk to next chunkserver in the
 // pipeline. It is used to implement Chunk transmission between chunkservers.
-func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
+func sendChunk2Client(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string) error {
 	DNInfo.IncIOLoad()
 	defer DNInfo.DecIOLoad()
 	checkSums, err := getChecksumFromFile(chunkId)
+	Logger.Warnf("get checkSums: %v", checkSums)
 	if err != nil {
 		return err
 	}
@@ -442,13 +443,18 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 		return err
 	}
 	pieceNum := int(fInfo.Size() / common.MB)
+	if fInfo.Size()%common.MB != 0 {
+		pieceNum++
+	}
 	buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
-
+	defer unix.Munmap(buffer)
 	if err != nil {
 		return err
 	}
 	for i := 0; i < pieceNum-1; i++ {
 		if util.CRC32String(buffer[i*common.MB:(i+1)*common.MB]) != checkSums[i] {
+			Logger.Warnf("Checksum of chunk %s is not correct, piece index: %d, cuurent checksum is: %v, want: %v",
+				chunkId, i, util.CRC32String(buffer[i*common.MB:(i+1)*common.MB]), checkSums[i])
 			MarkInvalidChunk(chunkId)
 			return errors.New("checksum is invalid")
 		}
@@ -460,6 +466,8 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 		}
 	}
 	if util.CRC32String(buffer[(pieceNum-1)*common.MB:]) != checkSums[pieceNum-1] {
+		Logger.Warnf("Checksum of chunk %s is not correct, piece index: %d, cuurent checksum is: %v, want: %v",
+			chunkId, pieceNum-1, util.CRC32String(buffer[(pieceNum-1)*common.MB:]), checkSums[pieceNum-1])
 		MarkInvalidChunk(chunkId)
 		return errors.New("checksum is invalid")
 	}
@@ -473,20 +481,18 @@ func sendChunk(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId string)
 }
 
 func getChecksumFromFile(chunkId string) ([]string, error) {
-	checksum := make([]string, 0, common.ChunkMBNum)
+	checksums := make([]string, 0, common.ChunkMBNum)
 	file, err := os.Open(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
 	if err != nil {
 		return nil, err
 	}
-	buffer := make([]byte, 256)
+	buffer := make([]byte, common.KB)
 	n, err := file.Read(buffer)
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < n/4; i++ {
-		checksum[i] = util.Bytes2String(buffer[i*4 : (i+1)*4])
-	}
-	return checksum, nil
+	checksums = strings.Split(string(buffer[:n]), checksumDelimiter)
+	return checksums, nil
 }
 
 // getLocalChunksId walks through the chunk directory and get all chunks names.
@@ -566,24 +572,7 @@ func sendTasks2Consumer(info *BatchChunkTaskInfo) {
 		for i := 0; i < len(dataNodeIds); i++ {
 			adds = append(adds, info.task.Adds[dataNodeIds[i]])
 		}
-		var stream pb.PipLineService_TransferChunkClient
-		stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
-		// Let consumeSingleTask handle this error.
-		if err != nil {
-			Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
-			stream = nil
-		}
-		checkSums, err := getChecksumFromFile(chunkId)
-		if err != nil {
-			Logger.Errorf("Fail to get checksum of the chunk, error detail: %s", err.Error())
-			stream = nil
-		}
-		stream, err = getNextStream(chunkId, adds, int(stat.Size()), checkSums)
-		if err != nil {
-			// Todo
-			Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
-			stream = nil
-		}
+		stream, _ := getSingleTask(chunkId, adds)
 		info.chunkTaskChan <- &ChunkTask{
 			stream:      stream,
 			ChunkId:     chunkId,
@@ -592,6 +581,28 @@ func sendTasks2Consumer(info *BatchChunkTaskInfo) {
 			SendType:    pc.sendType,
 		}
 	}
+}
+
+func getSingleTask(chunkId string, adds []string) (pb.PipLineService_TransferChunkClient, error) {
+	var stream pb.PipLineService_TransferChunkClient
+	stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
+	// Let consumeSingleTask handle this error.
+	if err != nil {
+		Logger.Errorf("Chunk not exist, error detail: %s", err.Error())
+		return nil, err
+	}
+	checkSums, err := getChecksumFromFile(chunkId)
+	if err != nil {
+		Logger.Errorf("Fail to get checksum of the chunk, error detail: %s", err.Error())
+		return nil, err
+	}
+	stream, err = getNextStream(chunkId, adds, int(stat.Size()), checkSums)
+	if err != nil {
+		// Todo
+		Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
+		return nil, err
+	}
+	return stream, nil
 }
 
 func handleConsumeResult(resultChan chan *util.ChunkTaskResult) (map[PendingChunk][]string, map[PendingChunk][]string,
@@ -679,13 +690,18 @@ func sendChunk2Cs(chunkId string, stream pb.PipLineService_TransferChunkClient) 
 		return err
 	}
 	pieceNum := int(fInfo.Size() / common.MB)
+	if fInfo.Size()%common.MB != 0 {
+		pieceNum++
+	}
 	buffer, err := unix.Mmap(int(file.Fd()), 0, int(fInfo.Size()), unix.PROT_WRITE, unix.MAP_SHARED)
-
+	defer unix.Munmap(buffer)
 	if err != nil {
 		return err
 	}
 	for i := 0; i < pieceNum-1; i++ {
 		if util.CRC32String(buffer[i*common.MB:(i+1)*common.MB]) != checkSums[i] {
+			Logger.Warnf("Checksum of chunk %s is not correct, piece index: %d, cuurent checksum is: %v, want: %v",
+				chunkId, pieceNum-1, util.CRC32String(buffer[(pieceNum-1)*common.MB:]), checkSums[pieceNum-1])
 			MarkInvalidChunk(chunkId)
 			return errors.New("checksum is invalid")
 		}
@@ -697,6 +713,8 @@ func sendChunk2Cs(chunkId string, stream pb.PipLineService_TransferChunkClient) 
 		}
 	}
 	if util.CRC32String(buffer[(pieceNum-1)*common.MB:]) != checkSums[pieceNum-1] {
+		Logger.Warnf("Checksum of chunk %s is not correct, piece index: %d, cuurent checksum is: %v, want: %v",
+			chunkId, pieceNum-1, util.CRC32String(buffer[(pieceNum-1)*common.MB:]), checkSums[pieceNum-1])
 		MarkInvalidChunk(chunkId)
 		return errors.New("checksum is invalid")
 	}
