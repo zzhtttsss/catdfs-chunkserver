@@ -33,7 +33,10 @@ const (
 	checksumDelimiter    = " "
 )
 
-// RegisterDataNode register this chunkserver to the master.
+// RegisterDataNode register this chunkserver to the master. Chunkserver will
+// report its disk status and chunk information to master. Master will return
+// the chunkserver's ID and the number of chunks that will be sent to this
+// chunkserver.
 func RegisterDataNode() *DataNodeInfo {
 	conn, _ := getMasterConn()
 	c := pb.NewRegisterServiceClient(conn)
@@ -63,7 +66,7 @@ func RegisterDataNode() *DataNodeInfo {
 	}
 }
 
-// getMasterConn get the RPC connection with the leader of the master cluster.
+// getMasterConn gets the RPC connection with the leader of the master cluster.
 func getMasterConn() (*grpc.ClientConn, error) {
 	ctx := context.Background()
 	kv := clientv3.NewKV(GlobalChunkServerHandler.EtcdClient)
@@ -84,9 +87,9 @@ func getMasterConn() (*grpc.ClientConn, error) {
 }
 
 // Heartbeat run in a goroutine. It keeps looping to do heartbeat with master
-// every several seconds. It sends the result of transferring Chunk and receive
-// the information which Chunk need to be transferred next and put the information
-// into the BatchChunkTaskChan.
+// every several seconds. It sends the result of all Chunk tasks that have
+// finished but not been sent to master and receive a batch of new Chunk tasks
+// and put them into the BatchChunkTaskChan.
 func Heartbeat() {
 	for {
 		errCount := 0
@@ -126,9 +129,10 @@ func Heartbeat() {
 		errCount = 0
 		time.Sleep(time.Second * time.Duration(viper.GetInt(common.ChunkHeartbeatSendTime)))
 	}
-
 }
 
+// handleHeartbeatReply handles the reply of heartbeat. It will convert all new
+// Chunk tasks to BatchChunkTask and put it into the BatchChunkTaskChan.
 func handleHeartbeatReply(reply *pb.HeartbeatReply) {
 	if reply.ChunkInfos != nil {
 		Logger.Debugf("Some chunks need to be proceed.")
@@ -147,6 +151,7 @@ func handleHeartbeatReply(reply *pb.HeartbeatReply) {
 				chunkId:  info.ChunkId,
 				sendType: int(info.SendType),
 			}
+			// Immediately execute remove task.
 			if info.SendType == common.DeleteSendType {
 				if dataNodeIds, ok := successSendResult[pc]; ok {
 					dataNodeIds = append(dataNodeIds, dataNodeIds...)
@@ -169,10 +174,12 @@ func handleHeartbeatReply(reply *pb.HeartbeatReply) {
 			Infos: infosMap,
 			Adds:  addsMap,
 		})
+		// Delete a batch of chunks at a time to avoid frequent locking
 		BatchRemoveChunkById(removedChunks)
 	}
 }
 
+// ChunkTransferInfo include all information of a chunk that needs to be transferred.
 type ChunkTransferInfo struct {
 	chunkId    string
 	addresses  []string
@@ -185,17 +192,27 @@ type ChunkTransferInfo struct {
 	nextStream pb.PipLineService_TransferChunkClient
 }
 
+// DoTransferChunk receive the chunk from a grpc stream and send it to the next
+// chunkserver(if needed).It will:
+// 1. get a ChunkTransferInfo from the stream.
+// 2. add the incomplete chunk to the chunkMap.
+// 3. get next stream if needed.
+// 4. start a IO goroutine to store the chunk to disk.
+// 5. receive the chunk from the stream and send it to the IO goroutine and the
+//    next stream(if needed).
+// 6. handle transfer result and reply to last chunkserver or client.
 func DoTransferChunk(stream pb.PipLineService_TransferChunkServer) error {
 	var (
 		wg             sync.WaitGroup
 		isStoreSuccess = true
 	)
-
 	info, err := getChunkTransferInfo(stream)
 	if err != nil {
 		return err
 	}
-	AddPendingChunk(info.chunkId)
+
+	AddIncompleteChunk(info.chunkId)
+
 	defer func() {
 		handleTransferResult(info, isStoreSuccess)
 	}()
@@ -230,6 +247,7 @@ func DoTransferChunk(stream pb.PipLineService_TransferChunkServer) error {
 	return nil
 }
 
+// getChunkTransferInfo get a ChunkTransferInfo from the stream.
 func getChunkTransferInfo(stream pb.PipLineService_TransferChunkServer) (*ChunkTransferInfo, error) {
 	failAdds := make([]string, 0)
 	// Get chunkId and slice including all chunkserver address that need to store this chunk.
@@ -253,6 +271,8 @@ func getChunkTransferInfo(stream pb.PipLineService_TransferChunkServer) (*ChunkT
 	}, nil
 }
 
+// handleTransferResult converts ChunkTransferInfo to pb.TransferChunkReply and
+// send it to the last chunkserver or client.
 func handleTransferResult(info *ChunkTransferInfo, isStoreSuccess bool) {
 	Logger.Debugf("Chunk: %s, failAdds: %v", info.chunkId, info.failAdds)
 	currentReply := &pb.TransferChunkReply{
@@ -271,6 +291,8 @@ func handleTransferResult(info *ChunkTransferInfo, isStoreSuccess bool) {
 	}
 }
 
+// consumePiece receives pieces of chunk from stream and send them to IO goroutine
+// and next stream(if needed).
 func consumePiece(info *ChunkTransferInfo) error {
 	pieceIndex := 0
 	for {
@@ -302,6 +324,8 @@ func consumePiece(info *ChunkTransferInfo) error {
 	}
 }
 
+// finishConsume closes pieceChan，waits for storeChunk function to finish and
+// handles error.
 func finishConsume(info *ChunkTransferInfo, wg *sync.WaitGroup, isSuccess bool) error {
 	close(info.pieceChan)
 	if info.nextStream != nil {
@@ -329,8 +353,7 @@ func finishConsume(info *ChunkTransferInfo, wg *sync.WaitGroup, isSuccess bool) 
 	return nil
 }
 
-// setNextStream builds stream to transfer this chunk to next chunkserver in the
-// pipeline.
+// setNextStream uses a ChunkTransferInfo to build a stream.
 func setNextStream(info *ChunkTransferInfo) {
 	var err error
 	info.nextStream, err = getNextStream(info.chunkId, info.addresses[1:], info.chunkSize, info.checkSums)
@@ -363,7 +386,7 @@ func getNextStream(chunkId string, addresses []string, chunkSize int, checkSums 
 	return c.TransferChunk(newCtx)
 }
 
-// StoreChunk stores a chunk as a file named its id in this chunkserver. For I/O
+// storeChunk stores a chunk as a file named its id in this chunkserver. For I/O
 // operation is very slow, this function will be run in a goroutine to not block
 // the main thread transferring the chunk to another chunkserver.
 func storeChunk(info *ChunkTransferInfo) {
@@ -414,8 +437,8 @@ func storeChunk(info *ChunkTransferInfo) {
 
 // DoSendStream2Client calls rpc to send data to client.
 func DoSendStream2Client(args *pb.SetupStream2DataNodeArgs, stream pb.SetupStream_SetupStream2DataNodeServer) error {
-	//TODO 检查资源完整性
-	//wait to return until sendChunk2Client is finished or err occurs
+	// TODO 检查资源完整性
+	// Wait to return until sendChunk2Client is finished or err occurs
 	err := sendChunk2Client(stream, args.ChunkId)
 	if err != nil {
 		return err
@@ -480,6 +503,7 @@ func sendChunk2Client(stream pb.SetupStream_SetupStream2DataNodeServer, chunkId 
 	return nil
 }
 
+// getChecksumFromFile reads checksum of a chunk from disk.
 func getChecksumFromFile(chunkId string) ([]string, error) {
 	checksums := make([]string, 0, common.ChunkMBNum)
 	file, err := os.Open(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
@@ -526,9 +550,9 @@ type BatchChunkTaskInfo struct {
 	resultChan    chan *util.ChunkTaskResult
 }
 
-// ConsumeBatchChunkTasks runs in a goroutine. It gets and consumes BatchChunkTask from
-// BatchChunkTaskChan. In particular, it will send all Chunk to the target chunkservers in
-// the BatchChunkTask and merge the result of BatchChunkTask into existing results.
+// ConsumeBatchChunkTasks runs in a goroutine. It gets and consumes BatchChunkTask
+// from BatchChunkTaskChan. In particular, it will handle all chunk tasks in incoming
+// BatchChunkTask and merge the result of BatchChunkTask into existing results.
 func ConsumeBatchChunkTasks() {
 	for batchChunkTask := range DNInfo.BatchChunkTaskChan {
 		info := startConsumeBatchTask(batchChunkTask)
@@ -541,6 +565,8 @@ func ConsumeBatchChunkTasks() {
 	}
 }
 
+// startConsumeBatchTask converts a BatchChunkTaskInfo to a BatchChunkTaskInfo
+// and starts several goroutines to consume the BatchChunkTaskInfo.
 func startConsumeBatchTask(batchChunkTask *BatchChunkTask) *BatchChunkTaskInfo {
 	var wg sync.WaitGroup
 	info := &BatchChunkTaskInfo{
@@ -564,26 +590,23 @@ func startConsumeBatchTask(batchChunkTask *BatchChunkTask) *BatchChunkTaskInfo {
 	return info
 }
 
+// sendTasks2Consumer sends all ChunkTask of a BatchChunkTaskInfo to consumer
+// through a channel.
 func sendTasks2Consumer(info *BatchChunkTaskInfo) {
-	for pc, dnId := range info.task.Infos {
+	for pc, dnIds := range info.task.Infos {
 		chunkId := pc.chunkId
-		dataNodeIds := dnId
+		dataNodeIds := dnIds
 		adds := make([]string, 0, len(dataNodeIds))
 		for i := 0; i < len(dataNodeIds); i++ {
 			adds = append(adds, info.task.Adds[dataNodeIds[i]])
 		}
-		stream, _ := getSingleTask(chunkId, adds)
-		info.chunkTaskChan <- &ChunkTask{
-			stream:      stream,
-			ChunkId:     chunkId,
-			DataNodeIds: dataNodeIds,
-			Adds:        adds,
-			SendType:    pc.sendType,
-		}
+		chunkTask, _ := getSingleChunkTask(chunkId, dataNodeIds, adds, pc.sendType)
+		info.chunkTaskChan <- chunkTask
 	}
 }
 
-func getSingleTask(chunkId string, adds []string) (pb.PipLineService_TransferChunkClient, error) {
+// getSingleChunkTask gets a ChunkTask from a BatchChunkTaskInfo.
+func getSingleChunkTask(chunkId string, dataNodeIds []string, adds []string, sendType int) (*ChunkTask, error) {
 	var stream pb.PipLineService_TransferChunkClient
 	stat, err := os.Stat(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
 	// Let consumeSingleTask handle this error.
@@ -602,9 +625,17 @@ func getSingleTask(chunkId string, adds []string) (pb.PipLineService_TransferChu
 		Logger.Errorf("Fail to get next stream, error detail: %s", err.Error())
 		return nil, err
 	}
-	return stream, nil
+	return &ChunkTask{
+		stream:      stream,
+		ChunkId:     chunkId,
+		DataNodeIds: dataNodeIds,
+		Adds:        adds,
+		SendType:    sendType,
+	}, nil
 }
 
+// handleConsumeResult converts the result of BatchChunkTask into a map of chunkId and
+// a map of dataNodeId. It also returns the chunkIds that should be removed.
 func handleConsumeResult(resultChan chan *util.ChunkTaskResult) (map[PendingChunk][]string, map[PendingChunk][]string,
 	[]string) {
 	var (
@@ -630,6 +661,7 @@ func handleConsumeResult(resultChan chan *util.ChunkTaskResult) (map[PendingChun
 	return newSuccessSendResult, newFailSendResult, removedChunkIds
 }
 
+// ChunkTask is the task that will be sent to the target chunkservers.
 type ChunkTask struct {
 	stream      pb.PipLineService_TransferChunkClient
 	ChunkId     string   `json:"chunk_id"`
@@ -638,8 +670,7 @@ type ChunkTask struct {
 	SendType    int      `json:"send_type"`
 }
 
-// consumeSingleTask establishes a pipeline, sends a Chunk to all target chunkserver
-// through the pipeline and return the result by the resultChan.
+// consumeSingleTask continuously gets ChunkTask from chunkTaskChan and consume it.
 func consumeSingleTask(taskChan chan *ChunkTask, resultChan chan *util.ChunkTaskResult) {
 	for task := range taskChan {
 		currentTaskResult, _ := doConsumeSingleTask(task)
@@ -647,6 +678,7 @@ func consumeSingleTask(taskChan chan *ChunkTask, resultChan chan *util.ChunkTask
 	}
 }
 
+// doConsumeSingleTask consumes a ChunkTask and return the result.
 func doConsumeSingleTask(task *ChunkTask) (*util.ChunkTaskResult, error) {
 	currentTaskResult := &util.ChunkTaskResult{
 		ChunkId:          task.ChunkId,
@@ -674,6 +706,7 @@ func doConsumeSingleTask(task *ChunkTask) (*util.ChunkTaskResult, error) {
 	return currentTaskResult, nil
 }
 
+// sendChunk2Cs sends a chunk to all target chunkservers through a pipeline.
 func sendChunk2Cs(chunkId string, stream pb.PipLineService_TransferChunkClient) error {
 	var err error
 	checkSums, err := getChecksumFromFile(chunkId)

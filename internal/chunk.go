@@ -30,7 +30,7 @@ type Chunk struct {
 	AddTime time.Time
 }
 
-func AddPendingChunk(chunkId string) {
+func AddIncompleteChunk(chunkId string) {
 	chunkInfo := strings.Split(chunkId, common.ChunkIdDelimiter)
 	index, _ := strconv.Atoi(chunkInfo[1])
 	updateChunksLock.Lock()
@@ -114,11 +114,13 @@ func EraseChunk(chunkId string) {
 	_ = os.Remove(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
 }
 
+// MarkInvalidChunk marks a Chunk as invalid.
 func MarkInvalidChunk(chunkId string) {
 	EraseChunk(chunkId)
 	invalidChunkSet.Add(chunkId)
 }
 
+// HandleInvalidChunks gets all invalid chunks which have been erased.
 func HandleInvalidChunks() []string {
 	num := invalidChunkSet.Cardinality()
 	chunkIds := make([]string, num)
