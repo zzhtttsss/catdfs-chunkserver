@@ -20,7 +20,7 @@ var (
 )
 
 type Chunk struct {
-	// Id is FileId, "_", Index
+	// Id is FileId + "_" + Index
 	Id     string
 	FileId string
 	Index  int
