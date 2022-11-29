@@ -1,6 +1,7 @@
 package internal
 
 import (
+	set "github.com/deckarep/golang-set"
 	"github.com/spf13/viper"
 	"os"
 	"strconv"
@@ -8,11 +9,13 @@ import (
 	"sync"
 	"time"
 	"tinydfs-base/common"
+	"tinydfs-base/util"
 )
 
 var (
 	// Store all Chunk, using id as the key
 	chunksMap        = make(map[string]*Chunk)
+	invalidChunkSet  = set.NewSet()
 	updateChunksLock = &sync.RWMutex{}
 )
 
@@ -27,7 +30,7 @@ type Chunk struct {
 	AddTime time.Time
 }
 
-func AddPendingChunk(chunkId string) {
+func AddIncompleteChunk(chunkId string) {
 	chunkInfo := strings.Split(chunkId, common.ChunkIdDelimiter)
 	index, _ := strconv.Atoi(chunkInfo[1])
 	updateChunksLock.Lock()
@@ -42,8 +45,8 @@ func AddPendingChunk(chunkId string) {
 }
 
 func FinishChunk(chunkId string) {
-	_ = os.Rename(viper.GetString(common.ChunkStoragePath)+chunkId+inCompleteFileSuffix,
-		viper.GetString(common.ChunkStoragePath)+chunkId)
+	_ = makeFileComplete(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
+	_ = makeFileComplete(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
 	updateChunksLock.Lock()
 	defer updateChunksLock.Unlock()
 	chunksMap[chunkId].IsComplete = true
@@ -61,8 +64,10 @@ func GetAllChunkIds() []string {
 	updateChunksLock.RLock()
 	defer updateChunksLock.RUnlock()
 	ids := make([]string, 0, len(chunksMap))
-	for id := range chunksMap {
-		ids = append(ids, id)
+	for id, chunk := range chunksMap {
+		if chunk.IsComplete {
+			ids = append(ids, id)
+		}
 	}
 	return ids
 }
@@ -71,17 +76,11 @@ func GetAllChunkIds() []string {
 // and timed out Chunk.
 func MonitorChunks() {
 	for {
-		updateChunksLock.Lock()
 		for id, chunk := range chunksMap {
 			if !chunk.IsComplete && int(time.Now().Sub(chunk.AddTime).Seconds()) > viper.GetInt(common.ChunkDeadTime) {
-				err := os.Remove(common.ChunkStoragePath + chunk.Id)
-				if err != nil {
-					continue
-				}
-				delete(chunksMap, id)
+				EraseChunk(id)
 			}
 		}
-		updateChunksLock.Unlock()
 		time.Sleep(time.Duration(viper.GetInt(common.ChunkCheckTime)) * time.Second)
 	}
 }
@@ -92,6 +91,41 @@ func BatchRemoveChunkById(chunkIds []string) {
 	for _, chunkId := range chunkIds {
 		if node, ok := chunksMap[chunkId]; ok {
 			node.IsComplete = false
+			_ = makeFileIncomplete(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
+			_ = makeFileIncomplete(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId, checkSumFileSuffix))
 		}
 	}
+}
+
+func makeFileComplete(filename string) error {
+	return os.Rename(util.CombineString(filename, incompleteFileSuffix), filename)
+}
+
+func makeFileIncomplete(filename string) error {
+	return os.Rename(filename, util.CombineString(filename, incompleteFileSuffix))
+}
+
+// EraseChunk totally removes a Chunk from the disk.
+func EraseChunk(chunkId string) {
+	updateChunksLock.Lock()
+	defer updateChunksLock.Unlock()
+	delete(chunksMap, chunkId)
+	_ = os.Remove(util.CombineString(viper.GetString(common.ChunkStoragePath), chunkId))
+	_ = os.Remove(util.CombineString(viper.GetString(common.ChecksumStoragePath), chunkId, checkSumFileSuffix))
+}
+
+// MarkInvalidChunk marks a Chunk as invalid.
+func MarkInvalidChunk(chunkId string) {
+	EraseChunk(chunkId)
+	invalidChunkSet.Add(chunkId)
+}
+
+// HandleInvalidChunks gets all invalid chunks which have been erased.
+func HandleInvalidChunks() []string {
+	num := invalidChunkSet.Cardinality()
+	chunkIds := make([]string, num)
+	for i := 0; i < num; i++ {
+		chunkIds[i] = invalidChunkSet.Pop().(string)
+	}
+	return chunkIds
 }
