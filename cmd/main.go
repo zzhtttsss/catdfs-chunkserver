@@ -17,7 +17,7 @@ func init() {
 	config.InitConfig()
 	internal.CreateGlobalChunkServerHandler()
 	internal.DNInfo = internal.RegisterDataNode()
-	go internal.ConsumeSendingTasks()
+	go internal.ConsumeBatchChunkTasks()
 	go internal.MonitorChunks()
 }
 

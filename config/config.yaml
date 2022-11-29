@@ -12,7 +12,8 @@ chunk:
    reconnectCount: 5  # heartbeat出问题时的重连次数
    sendTime: 5        # 每隔5s发送一次
   storage:
-    path: "./chunks/"
+    chunkPath: "./chunks/"
+    checksumPath: "./checksums/"
     checkTime: 600
     chunkDeadTime: 600
     capacity: 2147483648
