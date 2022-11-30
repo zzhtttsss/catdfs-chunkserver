@@ -399,16 +399,12 @@ func storeChunk(info *ChunkTransferInfo) {
 		}
 		close(info.errChan)
 	}()
-	chunkFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChunkStoragePath), info.chunkId, incompleteFileSuffix),
-		os.O_RDWR|os.O_CREATE, 0644)
+	chunkFile, err := util.CreateFile(util.CombineString(viper.GetString(common.ChunkStoragePath),
+		info.chunkId, incompleteFileSuffix), int64(info.chunkSize), 0644)
 	if err != nil {
 		return
 	}
 	defer chunkFile.Close()
-	err = chunkFile.Truncate(int64(info.chunkSize))
-	if err != nil {
-		return
-	}
 	chunkData, err := unix.Mmap(int(chunkFile.Fd()), 0, info.chunkSize, syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return
