@@ -48,10 +48,10 @@ func CreateGlobalChunkServerHandler() {
 func (handler *ChunkServerHandler) TransferChunk(stream pb.PipLineService_TransferChunkServer) error {
 	p, _ := peer.FromContext(stream.Context())
 	address := p.Addr.String()
-	Logger.Infof("Start to receive snd send chunk from: %s", address)
-	err := DoTransferFile(stream)
+	Logger.Infof("Start to receive a chunk from: %s", address)
+	err := DoTransferChunk(stream)
 	if err != nil {
-		Logger.Errorf("Fail to receive snd send chunk from: %s", address)
+		Logger.Errorf("Fail to receive a chunk from: %s", address)
 		details, _ := status.New(codes.Internal, err.Error()).WithDetails(&pb.RPCError{
 			Code: common.ChunkServerTransferChunkFailed,
 			Msg:  err.Error(),
@@ -79,7 +79,7 @@ func (handler *ChunkServerHandler) Server() {
 	go Heartbeat()
 	ip, _ := util.GetLocalIP()
 	Logger.Infof("local ip is: %s", ip)
-	listener, err := net.Listen(common.TCP, common.AddressDelimiter+viper.GetString(common.ChunkPort))
+	listener, err := net.Listen(common.TCP, util.CombineString(common.AddressDelimiter, viper.GetString(common.ChunkPort)))
 	Logger.Infof("Listen address: %s", listener.Addr().String())
 	if err != nil {
 		Logger.Errorf("Fail to server, error code: %v, error detail: %s,", common.ChunkServerRPCServerFailed, err.Error())
