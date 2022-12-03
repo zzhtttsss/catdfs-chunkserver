@@ -59,6 +59,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.0 // indirect
 )
 
-replace tinydfs-base => github.com/zzhtttsss/catdfs-base v0.0.0-20221130032230-1454fab6dfad
+replace tinydfs-base => github.com/zzhtttsss/catdfs-base v1.1.0
 
 //replace tinydfs-base => ../catdfs-base
