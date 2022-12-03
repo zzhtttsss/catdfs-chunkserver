@@ -400,7 +400,7 @@ func storeChunk(info *ChunkTransferInfo) {
 		close(info.errChan)
 	}()
 	chunkFile, err := util.CreateFile(util.CombineString(viper.GetString(common.ChunkStoragePath),
-		info.chunkId, incompleteFileSuffix), int64(info.chunkSize), 0644)
+		info.chunkId, incompleteFileSuffix), int64(info.chunkSize), 0666)
 	if err != nil {
 		return
 	}
@@ -420,8 +420,9 @@ func storeChunk(info *ChunkTransferInfo) {
 	err = unix.Munmap(chunkData)
 	// Store checksum of the chunk to disk.
 	checkSumFile, err := os.OpenFile(util.CombineString(viper.GetString(common.ChecksumStoragePath), info.chunkId,
-		checkSumFileSuffix, incompleteFileSuffix), os.O_RDWR|os.O_CREATE, 0644)
+		checkSumFileSuffix, incompleteFileSuffix), os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
+		fmt.Println(err)
 		return
 	}
 	defer checkSumFile.Close()
